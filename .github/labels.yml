@@ -55,9 +55,6 @@
 - name: "type: feature: ui"
   description: New feature that adds functionality for the user
   color: "0e8a16"
-- name: "type: feature: physical"
-  description: New feature that adds new analysis/physical model
-  color: "0e8a16"
 - name: "type: testing"
   description: Testing improvements
   color: b1fc6f
@@ -83,3 +80,43 @@
 - name: "priority: high"
   description: High priority
   color: "B60205"
+
+# Context: which part of yabf an issue touches. Names match 21cmfast/21CMMC so the
+# org-wide Project can filter across both repos.
+- name: "context: framework"
+  description: Stage graph, resolver, posterior, priors and plugins
+  color: "c5def5"
+- name: "context: mcmc"
+  description: Samplers, sampler adapters and drivers (CosmoSIS, nautilus, ...)
+  color: "c5def5"
+- name: "context: io"
+  description: Config, output files, checkpoints and caching
+  color: "c5def5"
+- name: "context: error-handling"
+  description: Failure policies, exceptions and recovery
+  color: "c5def5"
+- name: "context: hpc"
+  description: MPI, worker processes, layouts and memory on clusters
+  color: "c5def5"
+
+- name: "effort: low"
+  description: Issues that will require less than a day of coding to implement
+  color: "BFD4F2"
+- name: "effort: high"
+  description: Issues that will probably require >1 full day of coding to implement
+  color: "B60205"
+
+- name: "upstream"
+  description: Caused by, or working around, a bug in a dependency (e.g. nautilus, CosmoSIS)
+  color: "fbca04"
+- name: "downstream: 21cmMC"
+  description: Needed by 21cmMC; check the change stays generic
+  color: "5319e7"
+
+# Applied by Dependabot; listed here so their colours and descriptions are managed too.
+- name: "dependencies"
+  description: Pull requests that update a dependency file
+  color: "0366d6"
+- name: "python:uv"
+  description: Pull requests that update python:uv code
+  color: "2b67c6"
