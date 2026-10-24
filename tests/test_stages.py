@@ -51,14 +51,16 @@ class Measure:
 
     name: str = "measure"
     tag: str = ""
+    slot: str = "field"
     consumes: ClassVar = frozenset()
     provides: ClassVar = {"var": Variance}
 
     @property
     def requires(self):
-        return {"field": Slot(Field, self.tag)}
+        return {self.slot: Slot(Field, self.tag)}
 
-    def compute(self, params, field):
+    def compute(self, params, **inputs):
+        (field,) = inputs.values()
         return {"var": Variance(float(np.var(field.values)))}
 
 
@@ -171,9 +173,10 @@ class Broken:
         ({}, r"returned \[\], but provides \['var'\]"),
         ({"var": Variance(1.0), "extra": 1.0}, r"returned \['extra', 'var'\]"),
         ({"var": 1.0}, "returned a float for slot 'var', which provides Variance"),
+        ({"var": Variance(1.0), 1: 1.0}, r"returned \[1, 'var'\]"),
         (Variance(1.0), "returned Variance"),
     ],
-    ids=["missing", "extra", "wrong_type", "not_a_mapping"],
+    ids=["missing", "extra", "wrong_type", "mixed_key_types", "not_a_mapping"],
 )
 def test_a_stage_that_breaks_its_contract_is_reported(returns, match):
     with pytest.raises(StageError, match=match):
@@ -227,8 +230,21 @@ def _problems(stages, params=None):
             [Simulator(), Simulator(), Measure()],
             "Several stages are named ['sim']; stage names must be unique.",
         ),
+        (
+            [Measure(name="params_slot", slot="params")],
+            (
+                "Stage 'params_slot' requires a slot named 'params', which is reserved "
+                "for the parameters passed to compute(); rename the slot."
+            ),
+        ),
     ],
-    ids=["missing", "missing_with_other_tag", "ambiguous", "duplicate_names"],
+    ids=[
+        "missing",
+        "missing_with_other_tag",
+        "ambiguous",
+        "duplicate_names",
+        "reserved_slot_name",
+    ],
 )
 def test_unresolvable_graphs_are_reported_with_readable_messages(stages, expected):
     assert expected in _problems(stages)
@@ -278,5 +294,11 @@ def test_every_problem_is_reported_at_once():
     params = ParamSpace([Param("unused", fixed=1.0)])
     stages = [Measure(name="m1"), Measure(name="m2"), Likelihood(), Likelihood()]
     problems = "\n".join(_problems(stages, params))
-    for kind in ["named ['like']", "no stage provides", "more than one", "'unused'"]:
-        assert kind in problems
+    for expected in [
+        "named ['like']",
+        "Stage 'm1' requires Field (slot 'field'), but no stage provides it",
+        "Stage 'm2' requires Field (slot 'field'), but no stage provides it",
+        "Stage 'like' requires Variance (slot 'var'), which is provided by more",
+        "'unused'",
+    ]:
+        assert expected in problems
