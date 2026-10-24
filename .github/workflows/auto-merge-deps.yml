@@ -16,13 +16,16 @@ jobs:
       - name: Dependabot metadata
         if: ${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
         id: metadata
-        uses: dependabot/fetch-metadata@v3
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98  # v3.1.0
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
+      # GitHub Actions updates move the SHA pins of actions that run with write
+      # tokens, so they always wait for a human: no bot approval, no auto-merge.
       - name: Approve the PR
+        if: ${{ !contains(fromJSON('["github-actions", "github_actions"]'), steps.metadata.outputs.package-ecosystem) }}
         run: gh pr review --approve "$PR_URL"
 
       - name: Enable auto-merge
-        if: ${{ github.event.pull_request.user.login == 'pre-commit-ci[bot]' || steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'}}
+        if: ${{ github.event.pull_request.user.login == 'pre-commit-ci[bot]' || (!contains(fromJSON('["github-actions", "github_actions"]'), steps.metadata.outputs.package-ecosystem) && (steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor')) }}
         run: gh pr merge --auto --merge "$PR_URL"
