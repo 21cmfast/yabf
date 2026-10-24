@@ -1,10 +1,23 @@
 name: Labeler
 
-on: push
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/labels.yml'
+      - '.github/workflows/labeler.yml'
+  pull_request:
+    paths:
+      - '.github/labels.yml'
+      - '.github/workflows/labeler.yml'
 
 jobs:
   labeler:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -13,3 +26,8 @@ jobs:
         uses: crazy-max/ghaction-github-labeler@v6.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          yaml-file: .github/labels.yml
+          # Only create/update the labels listed in labels.yml; never delete others.
+          skip-delete: true
+          # On PRs, report what would change without touching the repo's labels.
+          dry-run: ${{ github.event_name == 'pull_request' }}
