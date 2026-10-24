@@ -260,16 +260,23 @@ class ParamSpace:
         each parameter is ``scale`` times that parameter's prior width, measured as half
         the central 68% interval. Points outside the prior are redrawn.
         """
-        center = self.fiducial if center is None else self._check_shape(center, "center")
+        center = (
+            self.fiducial if center is None else self._check_shape(center, "center")
+        )
         if not np.isfinite(self.log_prior(center)):
             raise ValueError("The centre of the Gaussian ball is outside the prior.")
         width = np.array(
-            [(p.prior.ppf(0.8413447) - p.prior.ppf(0.1586553)) / 2 for p in self.sampled]
+            [
+                (p.prior.ppf(0.8413447) - p.prior.ppf(0.1586553)) / 2
+                for p in self.sampled
+            ]
         )
         out = np.empty((n, self.ndim))
         todo = np.arange(n)
         for _ in range(max_tries):
-            out[todo] = center + scale * width * rng.standard_normal((len(todo), self.ndim))
+            out[todo] = center + scale * width * rng.standard_normal(
+                (len(todo), self.ndim)
+            )
             todo = todo[~np.isfinite(self.log_prior(out[todo]))]
             if not len(todo):
                 return out
