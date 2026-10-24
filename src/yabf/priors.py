@@ -20,9 +20,13 @@ from scipy import stats
 class Prior(Protocol):
     """The interface a prior must provide."""
 
-    def logpdf(self, x): ...
+    def logpdf(self, x):
+        """Return the log probability density at ``x``."""
+        ...
 
-    def ppf(self, q): ...
+    def ppf(self, q):
+        """Return the parameter value below which a fraction ``q`` of the prior lies."""
+        ...
 
 
 def uniform(low: float, high: float) -> Prior:
