@@ -92,6 +92,27 @@ def test_gaussian_ball_is_inside_the_prior_with_the_requested_width(space):
     np.testing.assert_allclose(theta.std(axis=0), sigma, rtol=0.03)
 
 
+def test_points_of_infinite_density_are_inside_the_prior():
+    # The arcsine distribution has infinite density at the edges of its support.
+    space = ParamSpace([Param("x", prior=stats.beta(0.5, 0.5), fiducial=0.0)])
+    assert space.log_prior([0.0]) == np.inf
+    theta = space.gaussian_ball(100, np.random.default_rng(6), scale=0.1)
+    assert np.all((theta >= 0) & (theta <= 1))
+
+
+def test_gaussian_ball_needs_a_single_centre(space):
+    with pytest.raises(ValueError, match="center must have shape"):
+        space.gaussian_ball(4, np.random.default_rng(), center=np.zeros((4, 3)))
+
+
+def test_a_space_with_nothing_sampled_has_an_empty_prior():
+    space = ParamSpace([Param("a", fixed=1.0), Param("b", tied={"a": 2.0})])
+    theta = space.sample_prior(5, np.random.default_rng(7))
+    assert theta.shape == (5, 0)
+    np.testing.assert_array_equal(space.log_prior(theta), np.zeros(5))
+    np.testing.assert_array_equal(space.to_model(theta)["b"], np.full(5, 2.0))
+
+
 def test_gaussian_ball_redraws_points_outside_a_bounded_prior():
     # Centred on the edge-adjacent point of a uniform prior: about half the raw draws
     # fall outside and must be redrawn.
@@ -216,13 +237,11 @@ def test_tied_parameters_do_not_change_the_prior():
     np.testing.assert_array_equal(tied.log_prior(theta), untied.log_prior(theta))
 
 
-def test_a_linear_tie_can_have_an_offset():
-    space = ParamSpace(
-        [
-            Param("x", prior=(0.0, 1.0)),
-            Param(
-                "y", tied=Tie("linear", ("x",), {"coefficients": (2.0,), "offset": 1.0})
-            ),
-        ]
-    )
-    np.testing.assert_allclose(space.to_model([[0.25]])["y"], [1.5])
+def test_ties_are_immutable_and_hashable():
+    kwargs = {"offset": 1.0, "coefficients": [2.0]}
+    tie = Tie("linear", ("x",), kwargs)
+    kwargs["offset"] = 5.0  # changing the caller's dict leaves the tie unchanged
+    same = Tie("linear", ("x",), {"coefficients": (2.0,), "offset": 1.0})
+    assert tie == same
+    assert hash(tie) == hash(same)
+    np.testing.assert_allclose(tie({"x": np.array([0.25])}), [1.5])
