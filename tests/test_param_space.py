@@ -5,7 +5,14 @@ import pytest
 from scipy import stats
 
 from yabf import priors
-from yabf.params import Param, ParamSpace, get_transform, register_transform
+from yabf.params import (
+    Param,
+    ParamSpace,
+    Tie,
+    get_transform,
+    register_relation,
+    register_transform,
+)
 
 
 @pytest.fixture
@@ -99,7 +106,8 @@ def test_gaussian_ball_redraws_points_outside_a_bounded_prior():
         ({}, "exactly one"),
         ({"prior": (0.0, 1.0), "fixed": 0.5}, "exactly one"),
         ({"prior": (0.0, 1.0), "fiducial": 2.0}, "outside the support"),
-        ({"prior": (0.0, 1.0), "transform": "nope"}, "Unknown transform"),
+        ({"prior": (0.0, 1.0), "tied": "y"}, "exactly one"),
+        ({"tied": "y", "transform": "pow10"}, "no transform"),
     ],
 )
 def test_invalid_params_raise(kwargs, match):
@@ -112,13 +120,109 @@ def test_invalid_params_raise(kwargs, match):
     [
         ([Param("x", prior=(0, 1)), Param("x", prior=(0, 2))], "names"),
         ([Param("x", prior=(0, 1)), Param("y", prior=(0, 1), feeds="x")], "feeds"),
+        ([Param("x", prior=(0, 1)), Param("y", tied="z")], "no parameter feeds"),
+        ([Param("x", tied="y"), Param("y", tied={"x": 2.0})], "cycle"),
     ],
 )
-def test_duplicate_names_or_feeds_raise(params, match):
+def test_inconsistent_param_spaces_raise(params, match):
     with pytest.raises(ValueError, match=match):
         ParamSpace(params)
 
 
-def test_registered_transform_cannot_be_overwritten():
-    with pytest.raises(ValueError, match="already registered"):
-        register_transform("pow10", np.exp, np.log)
+@pytest.mark.parametrize(
+    ("make", "match"),
+    [
+        (lambda: Param("x", prior=(0.0, 1.0), transform="nope"), "Unknown transform"),
+        (lambda: Tie("nope", ("y",)), "Unknown relation"),
+        (lambda: register_transform("pow10", np.exp, np.log), "already registered"),
+        (lambda: register_relation("linear", np.exp), "already registered"),
+    ],
+    ids=[
+        "unknown_transform",
+        "unknown_relation",
+        "transform_exists",
+        "relation_exists",
+    ],
+)
+def test_names_must_be_registered_once(make, match):
+    with pytest.raises(ValueError, match=match):
+        make()
+
+
+def _astro_params(order):
+    # 21cmFAST's dependent defaults for the minihalo parameters, in log10 units.
+    params = {
+        "F_STAR10_ACG": Param("F_STAR10_ACG", prior=(-3.0, 0.0)),
+        "ALPHA_STAR_ACG": Param("ALPHA_STAR_ACG", prior=(-0.5, 1.0)),
+        "F_STAR7_MCG": Param(
+            "F_STAR7_MCG", tied={"F_STAR10_ACG": 1.0, "ALPHA_STAR_ACG": -3.0}
+        ),
+        "ALPHA_STAR_MCG": Param("ALPHA_STAR_MCG", tied="ALPHA_STAR_ACG"),
+        "LX_OVER_SFR_ACG": Param("LX_OVER_SFR_ACG", fixed=40.0),
+        "LX_OVER_SFR_MCG": Param("LX_OVER_SFR_MCG", tied="LX_OVER_SFR_ACG"),
+        # A tie of a tie: resolved after the tie it depends on, whatever the order.
+        "F_STAR7_COPY": Param("F_STAR7_COPY", tied="F_STAR7_MCG"),
+    }
+    return ParamSpace([params[k] for k in order])
+
+
+_DEPENDENCIES_FIRST = [
+    "F_STAR10_ACG",
+    "ALPHA_STAR_ACG",
+    "LX_OVER_SFR_ACG",
+    "F_STAR7_MCG",
+    "ALPHA_STAR_MCG",
+    "LX_OVER_SFR_MCG",
+    "F_STAR7_COPY",
+]
+ORDERS = {
+    "dependencies_first": _DEPENDENCIES_FIRST,
+    "dependencies_last": _DEPENDENCIES_FIRST[::-1],
+}
+
+
+@pytest.mark.parametrize("order", ORDERS.values(), ids=ORDERS.keys())
+def test_ties_reproduce_the_dependent_defaults_of_21cmfast(order):
+    space = _astro_params(order)
+    assert space.ndim == 2
+    assert len(space.tied) == 4
+
+    theta = space.sample_prior(12, np.random.default_rng(4)).reshape(3, 4, 2)
+    model = space.to_model(theta)
+    f10, alpha = model["F_STAR10_ACG"], model["ALPHA_STAR_ACG"]
+
+    np.testing.assert_allclose(model["F_STAR7_MCG"], f10 - 3 * alpha)
+    np.testing.assert_array_equal(model["ALPHA_STAR_MCG"], alpha)
+    np.testing.assert_array_equal(model["LX_OVER_SFR_MCG"], np.full((3, 4), 40.0))
+    np.testing.assert_array_equal(model["F_STAR7_COPY"], model["F_STAR7_MCG"])
+
+
+def test_ties_relate_model_values_not_sampled_values():
+    # 'b' is sampled as log10_b; a parameter tied to 'b' receives 10**log10_b.
+    space = ParamSpace(
+        [
+            Param("log10_b", prior=(-1.0, 1.0), feeds="b", transform="pow10"),
+            Param("c", tied="b"),
+        ]
+    )
+    model = space.to_model(np.array([[0.5], [-0.5]]))
+    np.testing.assert_allclose(model["c"], 10 ** np.array([0.5, -0.5]))
+
+
+def test_tied_parameters_do_not_change_the_prior():
+    tied = _astro_params(ORDERS["dependencies_first"])
+    untied = ParamSpace(tied.sampled)
+    theta = tied.sample_prior(20, np.random.default_rng(5))
+    np.testing.assert_array_equal(tied.log_prior(theta), untied.log_prior(theta))
+
+
+def test_a_linear_tie_can_have_an_offset():
+    space = ParamSpace(
+        [
+            Param("x", prior=(0.0, 1.0)),
+            Param(
+                "y", tied=Tie("linear", ("x",), {"coefficients": (2.0,), "offset": 1.0})
+            ),
+        ]
+    )
+    np.testing.assert_allclose(space.to_model([[0.25]])["y"], [1.5])
