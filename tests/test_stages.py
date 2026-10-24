@@ -210,14 +210,18 @@ def _problems(stages, params=None):
         ),
         (
             [Simulator(tag="raw"), Measure()],
-            "Stage 'measure' requires Field (slot 'field'), but no stage provides it "
-            "('sim' provides Field['raw']).",
+            (
+                "Stage 'measure' requires Field (slot 'field'), but no stage provides "
+                "it ('sim' provides Field['raw'])."
+            ),
         ),
         (
             [Simulator(name="sim_a"), Simulator(name="sim_b"), Measure()],
-            "Stage 'measure' requires Field (slot 'field'), which is provided by more "
-            "than one stage: 'sim_a' (slot 'field'), 'sim_b' (slot 'field'). Give the "
-            "outputs distinct tags.",
+            (
+                "Stage 'measure' requires Field (slot 'field'), which is provided by "
+                "more than one stage: 'sim_a' (slot 'field'), 'sim_b' (slot 'field'). "
+                "Give the outputs distinct tags."
+            ),
         ),
         (
             [Simulator(), Simulator(), Measure()],
