@@ -1,7 +1,4 @@
 # See https://github.com/marketplace/actions/release-drafter for configuration
-# Keep one draft per branch, so pushes to v2.x (2.x fixes) and main (v3) don't
-# overwrite each other's draft release.
-filter-by-commitish: true
 categories:
   - title: ":boom: Breaking Changes"
     labels:
@@ -39,6 +36,17 @@ categories:
     labels:
       - "type: maint: dependencies"
       - "type: maint: build"
+  # Next version: major for an API break, minor for a new feature, else patch.
+  - type: 'version-resolver'
+    semver-increment: 'major'
+    when:
+      label: 'API Breaking'
+  - type: 'version-resolver'
+    semver-increment: 'minor'
+    when:
+      label: 'type: feature: ui'
+  - type: 'version-resolver'
+    semver-increment: 'patch'
 
 name-template: 'v$RESOLVED_VERSION'
 tag-template: 'v$RESOLVED_VERSION'

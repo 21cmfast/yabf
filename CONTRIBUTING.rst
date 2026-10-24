@@ -122,6 +122,8 @@ Deploying
 ---------
 
 A reminder for the maintainers on how to deploy. Release Drafter keeps a draft
-release for each branch up to date. Publish the draft for ``main`` (a v3 release) or
-for ``v2.x`` (a 2.x patch release) on GitHub; the ``deploy`` workflow then builds the
-package and uploads it to PyPI.
+release for ``main`` up to date; its version goes up by major for a pull request
+labelled ``API Breaking``, minor for ``type: feature: ui``, else patch. Publish the
+draft on GitHub; the ``deploy`` workflow then builds the package and uploads it to
+PyPI. For a 2.x patch release, draft a release by hand with target ``v2.x`` and the
+next 2.x tag (e.g. ``v2.1.5``).
