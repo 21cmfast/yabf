@@ -1,6 +1,11 @@
 name: Update Draft Release
 
-on: push
+# Draft releases for main only. A push to any other branch (v2.x, feature branches)
+# would otherwise retarget main's draft. v2.x patch releases are drafted by hand.
+on:
+  push:
+    branches:
+      - main
 
 permissions:
   contents: write
