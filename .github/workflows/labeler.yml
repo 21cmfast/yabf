@@ -11,6 +11,13 @@ on:
     paths:
       - '.github/labels.yml'
       - '.github/workflows/labeler.yml'
+  # Manual re-sync, e.g. after a run was interrupted part-way.
+  workflow_dispatch:
+
+# Queue runs per ref so an older config can never be applied after a newer one.
+concurrency:
+  group: labeler-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   labeler:
