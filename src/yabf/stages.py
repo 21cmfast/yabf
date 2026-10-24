@@ -209,6 +209,12 @@ def resolve(stages: Iterable[Stage], params: ParamSpace | None = None) -> StageG
         problems.append(
             f"Several stages are named {dupes}; stage names must be unique."
         )
+    problems.extend(
+        f"Stage {s.name!r} requires a slot named 'params', which is reserved for the "
+        "parameters passed to compute(); rename the slot."
+        for s in stages
+        if "params" in s.requires
+    )
 
     links, link_problems = _link(stages)
     problems += link_problems
@@ -251,7 +257,7 @@ def call_stage(
     out = stage.compute(consumed, **inputs)
     provides = _provides(stage)
     if not isinstance(out, Mapping) or set(out) != set(provides):
-        got = sorted(out) if isinstance(out, Mapping) else type(out).__name__
+        got = sorted(out, key=str) if isinstance(out, Mapping) else type(out).__name__
         raise StageError(
             f"Stage {stage.name!r} returned {got}, but provides {sorted(provides)}."
         )
