@@ -141,7 +141,8 @@ class Param:
         """Check that the parameter is fully and consistently specified."""
         if (self.prior is None) == (self.fixed is None):
             raise ValueError(
-                f"Parameter '{self.name}' needs exactly one of a prior or a fixed value."
+                f"Parameter '{self.name}' needs exactly one of a prior or a fixed "
+                "value."
             )
         if self.prior is not None and not np.isfinite(self.prior.logpdf(self.fiducial)):
             raise ValueError(
@@ -232,7 +233,7 @@ class ParamSpace:
         return sum(p.prior.logpdf(theta[..., i]) for i, p in enumerate(self.sampled))
 
     def to_model(self, theta) -> dict[str, np.ndarray]:
-        """The model parameters for ``theta``: transformed sampled values and fixed ones.
+        """Return the model parameters for ``theta``, transformed, with fixed ones.
 
         Fixed values are broadcast to the batch shape of ``theta``.
         """
