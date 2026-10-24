@@ -1,4 +1,7 @@
 # See https://github.com/marketplace/actions/release-drafter for configuration
+# Keep one draft per branch, so pushes to v2.x (2.x fixes) and main (v3) don't
+# overwrite each other's draft release.
+filter-by-commitish: true
 categories:
   - title: ":boom: Breaking Changes"
     labels:
