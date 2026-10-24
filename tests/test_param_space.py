@@ -13,7 +13,9 @@ def space():
     return ParamSpace(
         [
             Param("a", prior=(-1.0, 3.0)),
-            Param("log10_b", prior=priors.normal(1.0, 0.5), feeds="b", transform="pow10"),
+            Param(
+                "log10_b", prior=priors.normal(1.0, 0.5), feeds="b", transform="pow10"
+            ),
             Param("c", fixed=2.0),
             Param("d", prior=stats.gamma(3.0)),
         ]
@@ -43,9 +45,7 @@ def test_prior_transform_draws_follow_each_marginal(space):
 def test_log_prior_is_the_sum_of_the_marginals(space):
     rng = np.random.default_rng(1)
     theta = space.sample_prior(50, rng).reshape(5, 10, 3)
-    expected = sum(
-        p.prior.logpdf(theta[..., i]) for i, p in enumerate(space.sampled)
-    )
+    expected = sum(p.prior.logpdf(theta[..., i]) for i, p in enumerate(space.sampled))
     np.testing.assert_allclose(space.log_prior(theta), expected)
 
 
