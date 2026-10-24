@@ -1,9 +1,13 @@
 """Sampled and fixed parameters, and the space they span.
 
-A :class:`Param` is one parameter of an inference: either sampled, with a prior, or
-fixed. It feeds one model parameter, possibly through a named transform, so that the
-sampler can work in a convenient space: for example, sample ``log10_L_X`` uniformly
-and feed ``L_X = 10**log10_L_X`` to the model.
+A :class:`Param` is one parameter of an inference: sampled with a prior, fixed, or
+tied to other parameters. It feeds one model parameter, possibly through a named
+transform, so that the sampler can work in a convenient space: for example, sample
+``log10_L_X`` uniformly and feed ``L_X = 10**log10_L_X`` to the model.
+
+A tied parameter is computed from other model parameters by a named relation, such as
+``equal`` or ``linear``. Relations are named, like transforms, so that a parameter
+space can be written to and read from a configuration file.
 
 A :class:`ParamSpace` is an ordered collection of parameters. It provides what samplers
 need, vectorised over any leading batch dimensions: the prior transform from the unit
@@ -13,7 +17,8 @@ fiducial point for initialising walkers.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import graphlib
+from collections.abc import Callable, Mapping, Sequence
 
 import attrs
 import numpy as np
@@ -74,6 +79,108 @@ register_transform("exp", np.exp, np.log)
 register_transform("log", np.log, np.exp)
 
 
+@attrs.frozen
+class Relation:
+    """A named, vectorised function computing a model parameter from others.
+
+    The function is called with the input values as positional arguments, followed by
+    the tie's keyword arguments.
+    """
+
+    name: str
+    function: Callable[..., np.ndarray]
+
+
+_RELATIONS: dict[str, Relation] = {}
+
+
+def register_relation(name: str, function: Callable[..., np.ndarray]) -> Relation:
+    """Register a relation under ``name``, so that a :class:`Tie` can refer to it.
+
+    The function must be vectorised: it receives one array per input, all of the same
+    shape, and returns an array of that shape.
+    """
+    if name in _RELATIONS:
+        raise ValueError(f"A relation named '{name}' is already registered.")
+    relation = Relation(name=name, function=function)
+    _RELATIONS[name] = relation
+    return relation
+
+
+def get_relation(name: str) -> Relation:
+    """Return the registered relation called ``name``."""
+    try:
+        return _RELATIONS[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown relation '{name}'. Registered relations: {sorted(_RELATIONS)}."
+        ) from None
+
+
+def _equal(x):
+    return x
+
+
+def _linear(*xs, coefficients, offset=0.0):
+    return offset + sum(c * x for c, x in zip(coefficients, xs, strict=True))
+
+
+register_relation("equal", _equal)
+register_relation("linear", _linear)
+
+
+@attrs.frozen
+class Tie:
+    """A model parameter computed from other model parameters by a named relation.
+
+    Parameters
+    ----------
+    relation
+        The name of a registered relation.
+    inputs
+        The model parameters passed to the relation, in order.
+    kwargs
+        Keyword arguments passed to the relation.
+
+    Examples
+    --------
+    ``F_STAR7 = F_STAR10 - 3 * ALPHA_STAR``:
+
+    >>> tie = Tie("linear", ("F_STAR10", "ALPHA_STAR"), {"coefficients": (1, -3)})
+    """
+
+    relation: str = attrs.field()
+    inputs: tuple[str, ...] = attrs.field(converter=tuple)
+    kwargs: dict = attrs.field(factory=dict, converter=dict)
+
+    @relation.validator
+    def _relation_validator(self, att, value):
+        get_relation(value)
+
+    def __call__(self, values: Mapping[str, np.ndarray]) -> np.ndarray:
+        """Evaluate the relation on the inputs taken from ``values``."""
+        args = [values[name] for name in self.inputs]
+        return get_relation(self.relation).function(*args, **self.kwargs)
+
+
+def as_tie(tie) -> Tie:
+    """Return ``tie`` as a :class:`Tie`.
+
+    A string ``"x"`` ties the parameter to equal the model parameter ``x``. A mapping
+    ``{"x": a, "y": b}`` ties it to ``a * x + b * y``.
+    """
+    if isinstance(tie, Tie):
+        return tie
+    if isinstance(tie, str):
+        return Tie("equal", (tie,))
+    if isinstance(tie, Mapping):
+        return Tie("linear", tuple(tie), {"coefficients": tuple(tie.values())})
+    raise TypeError(
+        "A tie must be a Tie, the name of a model parameter, or a mapping of model "
+        f"parameters to coefficients; got {tie!r}."
+    )
+
+
 def _check_transform(inst, att, value):
     get_transform(value)
 
@@ -82,9 +189,13 @@ def _optional_prior(value):
     return None if value is None else as_prior(value)
 
 
+def _optional_tie(value):
+    return None if value is None else as_tie(value)
+
+
 @attrs.frozen
 class Param:
-    """A parameter of an inference: sampled with a prior, or fixed.
+    """A parameter of an inference: sampled with a prior, fixed, or tied.
 
     Parameters
     ----------
@@ -93,12 +204,16 @@ class Param:
     prior
         The prior: a ``(low, high)`` tuple for a uniform prior, or any object with
         ``logpdf`` and ``ppf`` methods, such as a frozen scipy distribution. Give
-        either a prior or a fixed value.
+        exactly one of a prior, a fixed value or a tie.
     fixed
         A fixed value. A fixed parameter is not sampled, but still feeds the model.
+    tied
+        A :class:`Tie` computing this parameter's model value from other model
+        parameters; see :func:`as_tie` for the short forms. A tied parameter is not
+        sampled and takes no transform.
     fiducial
         A reference value, in the sampled space. Defaults to the fixed value or the
-        median of the prior.
+        median of the prior; not defined for a tied parameter.
     feeds
         The model parameter this one determines. Defaults to ``name``.
     transform
@@ -114,6 +229,7 @@ class Param:
     fixed: float | None = attrs.field(
         default=None, converter=attrs.converters.optional(float), kw_only=True
     )
+    tied: Tie | None = attrs.field(default=None, converter=_optional_tie, kw_only=True)
     fiducial: float = attrs.field(converter=float, kw_only=True)
     feeds: str = attrs.field(kw_only=True)
     transform: str = attrs.field(
@@ -126,7 +242,7 @@ class Param:
         if self.fixed is not None:
             return self.fixed
         if self.prior is None:
-            return np.nan  # rejected in __attrs_post_init__ with a clear message
+            return np.nan  # tied, or rejected in __attrs_post_init__
         return self.prior.ppf(0.5)
 
     @feeds.default
@@ -139,10 +255,16 @@ class Param:
 
     def __attrs_post_init__(self):
         """Check that the parameter is fully and consistently specified."""
-        if (self.prior is None) == (self.fixed is None):
+        given = [x is not None for x in (self.prior, self.fixed, self.tied)]
+        if sum(given) != 1:
             raise ValueError(
-                f"Parameter '{self.name}' needs exactly one of a prior or a fixed "
-                "value."
+                f"Parameter '{self.name}' needs exactly one of a prior, a fixed value "
+                "or a tie."
+            )
+        if self.is_tied and self.transform != "identity":
+            raise ValueError(
+                f"Parameter '{self.name}' is tied, so its value comes from its "
+                "relation and it takes no transform."
             )
         if self.prior is not None and not np.isfinite(self.prior.logpdf(self.fiducial)):
             raise ValueError(
@@ -154,6 +276,16 @@ class Param:
     def is_fixed(self) -> bool:
         """Whether the parameter is fixed rather than sampled."""
         return self.fixed is not None
+
+    @property
+    def is_tied(self) -> bool:
+        """Whether the parameter is tied to other parameters."""
+        return self.tied is not None
+
+    @property
+    def is_sampled(self) -> bool:
+        """Whether the parameter is sampled."""
+        return self.prior is not None
 
     def to_model(self, value):
         """Map a value in the sampled space to the value the model receives."""
@@ -168,6 +300,25 @@ def _unique(kind: str, values: Sequence[str]):
         raise ValueError(f"Duplicate parameter {kind}: {sorted(dupes)}.")
 
 
+def _tie_order(params: Sequence[Param]) -> tuple[Param, ...]:
+    """Order the tied parameters so that each comes after the ties it depends on."""
+    tied = {p.feeds: p for p in params if p.is_tied}
+    known = {p.feeds for p in params}
+    graph = {}
+    for feeds, p in tied.items():
+        missing = sorted(set(p.tied.inputs) - known)
+        if missing:
+            raise ValueError(
+                f"Parameter '{p.name}' is tied to {missing}, which no parameter feeds."
+            )
+        graph[feeds] = {name for name in p.tied.inputs if name in tied}
+    try:
+        order = graphlib.TopologicalSorter(graph).static_order()
+        return tuple(tied[feeds] for feeds in order)
+    except graphlib.CycleError as e:
+        raise ValueError(f"Parameter ties form a cycle: {e.args[1]}.") from None
+
+
 @attrs.frozen
 class ParamSpace:
     """An ordered collection of parameters.
@@ -175,6 +326,9 @@ class ParamSpace:
     The sampled parameters, in order, define the coordinates the sampler sees. All
     methods taking ``theta`` or ``u`` accept arrays of shape ``(..., ndim)`` and are
     vectorised over the leading dimensions.
+
+    A tie's inputs must be model parameters fed by parameters in the space, and ties
+    may depend on other ties as long as they do not form a cycle.
     """
 
     params: tuple[Param, ...] = attrs.field(converter=tuple)
@@ -186,16 +340,22 @@ class ParamSpace:
                 raise TypeError(f"Expected Param instances, got {p!r}.")
         _unique("names", [p.name for p in value])
         _unique("feeds", [p.feeds for p in value])
+        _tie_order(value)
 
     @property
     def sampled(self) -> tuple[Param, ...]:
         """The sampled parameters, in order."""
-        return tuple(p for p in self.params if not p.is_fixed)
+        return tuple(p for p in self.params if p.is_sampled)
 
     @property
     def fixed(self) -> tuple[Param, ...]:
         """The fixed parameters."""
         return tuple(p for p in self.params if p.is_fixed)
+
+    @property
+    def tied(self) -> tuple[Param, ...]:
+        """The tied parameters."""
+        return tuple(p for p in self.params if p.is_tied)
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -233,14 +393,17 @@ class ParamSpace:
         return sum(p.prior.logpdf(theta[..., i]) for i, p in enumerate(self.sampled))
 
     def to_model(self, theta) -> dict[str, np.ndarray]:
-        """Return the model parameters for ``theta``, transformed, with fixed ones.
+        """Return the model parameters for ``theta``, keyed by the names they feed.
 
-        Fixed values are broadcast to the batch shape of ``theta``.
+        Sampled values are transformed, fixed values are broadcast to the batch shape
+        of ``theta``, and tied values are computed from the others.
         """
         theta = self._check_shape(theta, "theta")
         out = {p.feeds: p.to_model(theta[..., i]) for i, p in enumerate(self.sampled)}
         for p in self.fixed:
             out[p.feeds] = np.broadcast_to(p.to_model(p.fixed), theta.shape[:-1])
+        for p in _tie_order(self.params):
+            out[p.feeds] = p.tied(out)
         return out
 
     def sample_prior(self, n: int, rng: np.random.Generator) -> np.ndarray:
