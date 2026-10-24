@@ -20,9 +20,12 @@ jobs:
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
 
+      # GitHub Actions updates move the SHA pins of actions that run with write
+      # tokens, so they always wait for a human: no bot approval, no auto-merge.
       - name: Approve the PR
+        if: ${{ !contains(fromJSON('["github-actions", "github_actions"]'), steps.metadata.outputs.package-ecosystem) }}
         run: gh pr review --approve "$PR_URL"
 
       - name: Enable auto-merge
-        if: ${{ github.event.pull_request.user.login == 'pre-commit-ci[bot]' || steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor'}}
+        if: ${{ github.event.pull_request.user.login == 'pre-commit-ci[bot]' || (!contains(fromJSON('["github-actions", "github_actions"]'), steps.metadata.outputs.package-ecosystem) && (steps.metadata.outputs.update-type == 'version-update:semver-patch' || steps.metadata.outputs.update-type == 'version-update:semver-minor')) }}
         run: gh pr merge --auto --merge "$PR_URL"
