@@ -3,6 +3,50 @@
 See `CONTRIBUTING.rst` for setup, branches (`main` is v3, `v2.x` takes 2.x fixes) and
 the checks to run before pushing (`ruff` and `pytest`).
 
+## How we work
+
+### Documentation: scope and audience
+
+- **Docstrings are timeless and written for users.** Describe what the code does and
+  how to use it. No internal jargon, no milestone or task names, no references to
+  past issues, pull requests or earlier behaviour.
+- **The README is short and to the point.**
+- **User-facing documentation never refers to internal decisions** or how we got here.
+- **Code comments may explain an internal decision** where that helps the next
+  reader, linking the issue if there is one. Never use jargon that only you (the
+  agent) know from the current session.
+
+### Tests
+
+- **Prefer physically or statistically meaningful tests** to "functionality" tests that
+  only raise coverage. Before writing tests, think about which general physical or
+  statistical conditions the code must satisfy (limits, symmetries, conservation,
+  known analytic cases, calibration of posteriors and estimators), and test those.
+- **Use `pytest.mark.parametrize`** instead of repeating near-identical tests.
+- **No tests that exist only for coverage.** A test that a method we just defined
+  exists, or that a constructor stores its arguments, tests nothing.
+
+### Code
+
+- **Look for an existing implementation before writing your own**, here and in our
+  dependencies. When scoping a change, ask whether refactoring existing code would
+  make it simpler.
+- **Prefer immutable objects with clear transformations**, built with `attrs`
+  (frozen classes; `evolve`/methods that return new objects rather than mutating).
+- **Prefer composition over inheritance**, unless inheritance is exactly right for
+  the job.
+- **Keep backwards compatibility** unless the change is for a new major version. If
+  keeping it means jumping through many hoops, stop and reconsider.
+- **If following these rules makes the code needlessly complicated or ugly, stop and
+  ask a human.**
+
+### Before committing
+
+- **Run the linters through the pre-commit hooks** (`uv run prek run --all-files`, or
+  `uv run prek install` so they run on every commit) and fix what they report.
+- **Don't silence a ruff rule on a line** (`# noqa`) or in the config without a very
+  good reason; usually, check with a human first.
+
 ## Label every pull request
 
 Always add labels when you open a pull request. Release Drafter builds the release notes
