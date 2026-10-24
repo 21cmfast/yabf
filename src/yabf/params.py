@@ -129,6 +129,13 @@ register_relation("equal", _equal)
 register_relation("linear", _linear)
 
 
+def _frozen_kwargs(kwargs) -> tuple[tuple[str, object], ...]:
+    return tuple(
+        (k, tuple(v) if isinstance(v, list) else v)
+        for k, v in sorted(dict(kwargs).items())
+    )
+
+
 @attrs.frozen
 class Tie:
     """A model parameter computed from other model parameters by a named relation.
@@ -140,7 +147,9 @@ class Tie:
     inputs
         The model parameters passed to the relation, in order.
     kwargs
-        Keyword arguments passed to the relation.
+        Keyword arguments passed to the relation. They are stored as sorted
+        ``(name, value)`` pairs, with lists turned into tuples, so that a tie is
+        immutable and hashable.
 
     Examples
     --------
@@ -151,7 +160,9 @@ class Tie:
 
     relation: str = attrs.field()
     inputs: tuple[str, ...] = attrs.field(converter=tuple)
-    kwargs: dict = attrs.field(factory=dict, converter=dict)
+    kwargs: tuple[tuple[str, object], ...] = attrs.field(
+        factory=tuple, converter=_frozen_kwargs
+    )
 
     @relation.validator
     def _relation_validator(self, att, value):
@@ -160,7 +171,7 @@ class Tie:
     def __call__(self, values: Mapping[str, np.ndarray]) -> np.ndarray:
         """Evaluate the relation on the inputs taken from ``values``."""
         args = [values[name] for name in self.inputs]
-        return get_relation(self.relation).function(*args, **self.kwargs)
+        return get_relation(self.relation).function(*args, **dict(self.kwargs))
 
 
 def as_tie(tie) -> Tie:
@@ -266,7 +277,7 @@ class Param:
                 f"Parameter '{self.name}' is tied, so its value comes from its "
                 "relation and it takes no transform."
             )
-        if self.prior is not None and not np.isfinite(self.prior.logpdf(self.fiducial)):
+        if self.prior is not None and not self.prior.logpdf(self.fiducial) > -np.inf:
             raise ValueError(
                 f"The fiducial value of '{self.name}' ({self.fiducial}) is outside the "
                 "support of its prior."
@@ -383,14 +394,16 @@ class ParamSpace:
     def prior_transform(self, u) -> np.ndarray:
         """Map points of the unit hypercube to the sampled parameters."""
         u = self._check_shape(u, "u")
-        return np.stack(
-            [p.prior.ppf(u[..., i]) for i, p in enumerate(self.sampled)], axis=-1
-        )
+        columns = [p.prior.ppf(u[..., i]) for i, p in enumerate(self.sampled)]
+        return np.stack(columns, axis=-1) if columns else np.empty(u.shape)
 
     def log_prior(self, theta) -> np.ndarray | float:
         """The log prior density of the sampled parameters (``-inf`` outside it)."""
         theta = self._check_shape(theta, "theta")
-        return sum(p.prior.logpdf(theta[..., i]) for i, p in enumerate(self.sampled))
+        return sum(
+            (p.prior.logpdf(theta[..., i]) for i, p in enumerate(self.sampled)),
+            start=np.zeros(theta.shape[:-1]),
+        )
 
     def to_model(self, theta) -> dict[str, np.ndarray]:
         """Return the model parameters for ``theta``, keyed by the names they feed.
@@ -420,14 +433,17 @@ class ParamSpace:
     ) -> np.ndarray:
         """Draw ``n`` points from a Gaussian ball inside the prior, shape ``(n, ndim)``.
 
-        The ball is centred on ``center`` (default: the fiducial point). Its width in
-        each parameter is ``scale`` times that parameter's prior width, measured as half
-        the central 68% interval. Points outside the prior are redrawn.
+        The ball is centred on ``center``, of shape ``(ndim,)`` (default: the fiducial
+        point). Its width in each parameter is ``scale`` times that parameter's prior
+        width, measured as half the central 68% interval. Points outside the prior are
+        redrawn.
         """
-        center = (
-            self.fiducial if center is None else self._check_shape(center, "center")
-        )
-        if not np.isfinite(self.log_prior(center)):
+        center = self.fiducial if center is None else np.asarray(center, dtype=float)
+        if center.shape != (self.ndim,):
+            raise ValueError(
+                f"center must have shape ({self.ndim},), got {center.shape}."
+            )
+        if not self.log_prior(center) > -np.inf:
             raise ValueError("The centre of the Gaussian ball is outside the prior.")
         width = np.array(
             [
@@ -441,7 +457,7 @@ class ParamSpace:
             out[todo] = center + scale * width * rng.standard_normal(
                 (len(todo), self.ndim)
             )
-            todo = todo[~np.isfinite(self.log_prior(out[todo]))]
+            todo = todo[~(self.log_prior(out[todo]) > -np.inf)]
             if not len(todo):
                 return out
         raise RuntimeError(
