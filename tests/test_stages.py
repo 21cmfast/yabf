@@ -8,8 +8,17 @@ import attrs
 import numpy as np
 import pytest
 
+from yabf import priors
 from yabf.params import Param, ParamSpace
-from yabf.stages import GraphError, Slot, StageError, call_stage, resolve
+from yabf.stages import (
+    REQUIRED,
+    GraphError,
+    ParamSpec,
+    Slot,
+    StageError,
+    call_stage,
+    resolve,
+)
 
 
 @attrs.frozen(eq=False)
@@ -33,7 +42,10 @@ class Simulator:
     name: str = "sim"
     tag: str = ""
     output: type = Field
-    consumes: ClassVar = frozenset({"sigma", "seed"})
+    consumes: ClassVar = {
+        "sigma": ParamSpec(REQUIRED, domain=(0, 10), description="Standard deviation."),
+        "seed": ParamSpec(0, description="Seed of the realisation."),
+    }
     requires: ClassVar = {}
 
     @property
@@ -41,8 +53,8 @@ class Simulator:
         return {"field": Slot(self.output, self.tag)}
 
     def compute(self, params):
-        noise = np.random.default_rng(params.get("seed", 0)).standard_normal(4096)
-        return {"field": self.output(params.get("sigma", 1.0) * noise)}
+        noise = np.random.default_rng(int(params["seed"])).standard_normal(4096)
+        return {"field": self.output(params["sigma"] * noise)}
 
 
 @attrs.frozen
@@ -52,7 +64,7 @@ class Measure:
     name: str = "measure"
     tag: str = ""
     slot: str = "field"
-    consumes: ClassVar = frozenset()
+    consumes: ClassVar = {}
     provides: ClassVar = {"var": Variance}
 
     @property
@@ -69,12 +81,12 @@ class Likelihood:
     """A Gaussian likelihood for the measured variance."""
 
     name: str = "like"
-    consumes: ClassVar = frozenset({"noise"})
+    consumes: ClassVar = {"noise": ParamSpec(0.0, domain=(0, np.inf))}
     requires: ClassVar = {"var": Variance}
     provides: ClassVar = {"lnl": float}
 
     def compute(self, params, var):
-        return {"lnl": -0.5 * (var.value + params.get("noise", 0.0) - 1.0) ** 2}
+        return {"lnl": -0.5 * (var.value + params["noise"] - 1.0) ** 2}
 
 
 def _run(graph, params):
@@ -137,29 +149,37 @@ def test_toy_stages_obey_the_stage_contract(stage):
         np.testing.assert_equal(_state(v), _state(before[k]))
 
 
-def test_a_stage_receives_only_the_parameters_it_consumes():
-    seen = {}
+@attrs.frozen
+class Spy:
+    seen: list = attrs.field(factory=list, eq=False)
+    name: str = "spy"
+    consumes: ClassVar = {"a": ParamSpec(REQUIRED), "b": ParamSpec(2.0)}
+    requires: ClassVar = {}
+    provides: ClassVar = {}
 
-    @attrs.frozen
-    class Spy:
-        name: str = "spy"
-        consumes: ClassVar = frozenset({"a", "b"})
-        requires: ClassVar = {}
-        provides: ClassVar = {}
+    def compute(self, params):
+        self.seen.append(dict(params))
+        return {}
 
-        def compute(self, params):
-            seen.update(params)
-            return {}
 
-    call_stage(Spy(), {"a": 1.0, "c": 3.0}, {})
-    assert seen == {"a": 1.0}
+def test_a_stage_receives_what_it_consumes_with_defaults_for_the_rest():
+    spy = Spy()
+    call_stage(spy, {"a": 1.0, "c": 3.0}, {})
+    assert spy.seen == [{"a": 1.0, "b": 2.0}]
+
+
+def test_a_missing_required_parameter_is_reported_before_computing():
+    spy = Spy()
+    with pytest.raises(StageError, match=r"requires the parameters \['a'\]"):
+        call_stage(spy, {"b": 1.0}, {})
+    assert spy.seen == []
 
 
 @attrs.frozen
 class Broken:
     name: str = "broken"
     returns: object = None
-    consumes: ClassVar = frozenset()
+    consumes: ClassVar = {}
     requires: ClassVar = {}
     provides: ClassVar = {"var": Variance}
 
@@ -256,7 +276,7 @@ def test_a_cycle_is_reported():
         """Requires the variance and provides the field it is measured from."""
 
         name: str = "feedback"
-        consumes: ClassVar = frozenset()
+        consumes: ClassVar = {}
         requires: ClassVar = {"var": Variance}
         provides: ClassVar = {"field": Field}
 
@@ -302,3 +322,155 @@ def test_every_problem_is_reported_at_once():
         "'unused'",
     ]:
         assert expected in problems
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"default": 2.0, "domain": (0, 1)}, r"default 2 is outside \[0, 1\]"),
+        ({"default": 0.0, "shape": (3,)}, r"has shape \(\), not \(3,\)"),
+        ({"domain": (1, 0)}, "low <= high"),
+    ],
+    ids=["default_outside_domain", "default_wrong_shape", "empty_domain"],
+)
+def test_inconsistent_param_specs_are_rejected(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        ParamSpec(**kwargs)
+
+
+def test_consumes_must_describe_each_parameter():
+    @attrs.frozen
+    class Bare:
+        name: str = "bare"
+        consumes: ClassVar = frozenset({"x"})
+        requires: ClassVar = {}
+        provides: ClassVar = {}
+
+        def compute(self, params):
+            return {}
+
+    with pytest.raises(TypeError, match="mapping from parameter names to ParamSpec"):
+        resolve([Bare()])
+
+
+@attrs.frozen
+class Bubbles:
+    """Bubbles of radius up to ``r_max`` in a box of side ``box``, at most a third."""
+
+    name: str = "bubbles"
+    consumes: ClassVar = {
+        "box": ParamSpec(100.0, domain=(0, np.inf)),
+        "r_max": ParamSpec(15.0, domain=(0, np.inf)),
+        "weights": ParamSpec((1.0, 1.0), shape=(2,)),
+    }
+    requires: ClassVar = {}
+    provides: ClassVar = {}
+
+    def check(self, params):
+        if params["r_max"] > params["box"] / 3:
+            raise ValueError("r_max must be at most a third of the box.")
+
+    def compute(self, params):
+        return {}
+
+
+@pytest.mark.parametrize(
+    ("stages", "params", "expected"),
+    [
+        (
+            [Simulator()],
+            [Param("seed", fixed=1)],
+            (
+                "Stage 'sim' requires the parameter 'sigma', which the parameter space "
+                "does not define."
+            ),
+        ),
+        (
+            [Simulator()],
+            [Param("sigma", fixed=-1.0)],
+            (
+                "Stage 'sim' rejects 'sigma' at the fiducial point: the value -1 is "
+                "outside [0, 10]."
+            ),
+        ),
+        (
+            [Simulator()],
+            [Param("sigma", prior=(5.0, 20.0))],
+            (
+                "Stage 'sim' rejects 'sigma' at the upper edge of the prior of "
+                "'sigma': the value 20 is outside [0, 10]."
+            ),
+        ),
+        (
+            # A normal prior has infinite support, so it cannot fit a bounded domain.
+            [Simulator()],
+            [Param("sigma", prior=priors.normal(5.0, 1.0))],
+            (
+                "Stage 'sim' rejects 'sigma' at the lower edge of the prior of "
+                "'sigma': the value -inf is outside [0, 10]."
+            ),
+        ),
+        (
+            # Domains apply to model values, after the transform.
+            [Simulator()],
+            [Param("log10_sigma", prior=(-1.0, 2.0), feeds="sigma", transform="pow10")],
+            (
+                "Stage 'sim' rejects 'sigma' at the upper edge of the prior of "
+                "'log10_sigma': the value 100 is outside [0, 10]."
+            ),
+        ),
+        (
+            # Tied values are checked at points near the edges of their inputs' priors.
+            [Simulator()],
+            [Param("base", prior=(1.0, 4.0)), Param("sigma", tied={"base": 3.0})],
+            "Stage 'sim' rejects 'sigma' with 'base' near the upper edge of its prior",
+        ),
+        (
+            [Bubbles()],
+            [Param("weights", fixed=1.0)],
+            (
+                "Stage 'bubbles' rejects 'weights' at the fiducial point: the value "
+                "1 has shape (), not (2,)."
+            ),
+        ),
+        (
+            # The default box (100) is used, and r_max reaches past a third of it.
+            [Bubbles()],
+            [Param("r_max", prior=(5.0, 50.0))],
+            (
+                "Stage 'bubbles' rejects the parameters with 'r_max' near the upper "
+                "edge of its prior: r_max must be at most a third of the box."
+            ),
+        ),
+    ],
+    ids=[
+        "required_missing",
+        "fixed_outside_domain",
+        "prior_outside_domain",
+        "unbounded_prior",
+        "transformed_prior",
+        "tied_outside_domain",
+        "wrong_shape",
+        "check_hook",
+    ],
+)
+def test_parameters_a_stage_does_not_accept_are_reported(stages, params, expected):
+    problems = _problems(stages, ParamSpace(params))
+    assert any(p.startswith(expected) for p in problems), problems
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        [Param("sigma", prior=(0.5, 10.0)), Param("seed", fixed=2)],
+        [Param("log10_sigma", prior=(-1.0, 1.0), feeds="sigma", transform="pow10")],
+        [Param("base", prior=(1.0, 3.0)), Param("sigma", tied={"base": 3.0})],
+    ],
+    ids=["bounded_prior", "transformed_prior", "tied"],
+)
+def test_parameter_spaces_inside_the_domains_resolve(params):
+    resolve([Simulator()], ParamSpace(params))
+
+
+def test_the_check_hook_passes_a_consistent_space():
+    resolve([Bubbles()], ParamSpace([Param("r_max", prior=(5.0, 30.0))]))
