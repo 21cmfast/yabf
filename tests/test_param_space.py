@@ -10,9 +10,11 @@ from yabf.params import (
     ParamSpace,
     Tie,
     get_transform,
+    param_vector,
     register_relation,
     register_transform,
 )
+from yabf.priors import Marginal
 
 
 @pytest.fixture
@@ -129,6 +131,7 @@ def test_gaussian_ball_redraws_points_outside_a_bounded_prior():
         ({"prior": (0.0, 1.0), "fiducial": 2.0}, "outside the support"),
         ({"prior": (0.0, 1.0), "tied": "y"}, "exactly one"),
         ({"tied": "y", "transform": "pow10"}, "no transform"),
+        ({"tied": "y", "feeds": "v", "index": 0}, "cannot be an element"),
     ],
 )
 def test_invalid_params_raise(kwargs, match):
@@ -245,3 +248,100 @@ def test_ties_are_immutable_and_hashable():
     assert tie == same
     assert hash(tie) == hash(same)
     np.testing.assert_allclose(tie({"x": np.array([0.25])}), [1.5])
+
+
+@pytest.mark.parametrize("batch", [(), (5,), (2, 3)])
+def test_vector_elements_are_assembled_into_one_model_parameter(batch):
+    space = ParamSpace(
+        [
+            *param_vector("p", 4, prior=(-10.0, 10.0), fixed={1: 0.0}),
+            Param("x", prior=(0, 1)),
+        ]
+    )
+    assert space.names == ("p_0", "p_2", "p_3", "x")
+    theta = space.sample_prior(int(np.prod(batch)), np.random.default_rng(6))
+    theta = theta.reshape((*batch, space.ndim))
+    model = space.to_model(theta)
+    assert model["p"].shape == (*batch, 4)
+    np.testing.assert_array_equal(model["p"][..., [0, 2, 3]], theta[..., :3])
+    np.testing.assert_array_equal(model["p"][..., 1], np.zeros(batch))
+    np.testing.assert_array_equal(model["x"], theta[..., 3])
+
+
+@pytest.mark.parametrize(
+    ("params", "match"),
+    [
+        (
+            [
+                Param("p_0", prior=(0, 1), feeds="p", index=0),
+                Param("p_2", prior=(0, 1), feeds="p", index=2),
+            ],
+            r"indices 0 to 1, each once; got \[0, 2\]",
+        ),
+        (
+            [Param("p", prior=(0, 1)), Param("p_0", prior=(0, 1), feeds="p", index=0)],
+            "both whole and element by element",
+        ),
+    ],
+    ids=["missing_element", "whole_and_elements"],
+)
+def test_inconsistent_vectors_are_rejected(params, match):
+    with pytest.raises(ValueError, match=match):
+        ParamSpace(params)
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs", "match"),
+    [
+        (("p",), {"prior": (0, 1)}, "length of vector 'p' must be given"),
+        (("p", 3), {"prior": [(0, 1), (0, 1)]}, "consistent"),
+        (("p", 2), {}, "needs a prior or a fixed value"),
+        (
+            ("p",),
+            {"prior": priors.multivariate_normal([0, 0], np.eye(2)), "fixed": {0: 1}},
+            "fix none",
+        ),
+    ],
+    ids=["no_length", "inconsistent_length", "no_prior", "joint_and_fixed"],
+)
+def test_param_vector_rejects_inconsistent_arguments(args, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        param_vector(*args, **kwargs)
+
+
+COV = np.array([[1.0, 0.8, 0.0], [0.8, 1.0, -0.5], [0.0, -0.5, 2.0]])
+
+
+def test_a_joint_prior_couples_its_parameters_wherever_they_are_listed():
+    mvn = priors.multivariate_normal([1.0, 2.0, 3.0], COV)
+    b0, b1, b2 = param_vector("beta", prior=mvn)
+    x = Param("x", prior=priors.normal(0.0, 1.0))
+    space = ParamSpace([b2, x, b0, b1])
+    np.testing.assert_allclose(space.fiducial, [3.0, 0.0, 1.0, 2.0])
+
+    n = 40_000
+    draws = space.sample_prior(n, np.random.default_rng(7))
+    beta, xs = draws[:, [2, 3, 0]], draws[:, 1]
+    np.testing.assert_allclose(np.cov(beta.T), COV, atol=5 * np.sqrt(2 / n) * 2.0)
+    # x is independent of the vector.
+    corr = [np.corrcoef(xs, beta[:, i])[0, 1] for i in range(3)]
+    assert np.all(np.abs(corr) < 5 / np.sqrt(n))
+
+    theta = draws[:10]
+    expected = mvn.logpdf(theta[:, [2, 3, 0]]) + stats.norm.logpdf(theta[:, 1])
+    np.testing.assert_allclose(space.log_prior(theta), expected)
+
+
+@pytest.mark.parametrize(
+    ("which", "match"),
+    [("subset", "all of them must be sampled"), ("repeat", "Two parameters take")],
+)
+def test_joint_priors_must_be_used_whole_and_once(which, match):
+    mvn = priors.multivariate_normal([0.0, 0.0, 0.0], COV)
+    params = list(param_vector("beta", prior=mvn))
+    if which == "subset":
+        params = params[:2]
+    else:
+        params.append(Param("extra", prior=Marginal(mvn, 0)))
+    with pytest.raises(ValueError, match=match):
+        ParamSpace(params)
