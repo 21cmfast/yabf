@@ -80,7 +80,9 @@ class ParamSpec:
         The closed interval ``(low, high)`` of values the stage accepts (the ends may
         be infinite), or ``None`` if it accepts any value.
     shape
-        The shape of the value: ``()`` for a scalar.
+        The shape of the value: ``()`` for a scalar. A stage whose parameters depend
+        on its configuration builds its specs from it: a polynomial stage of order
+        ``n`` consumes ``ParamSpec(shape=(n,))``.
     description
         What the parameter means, for people reading the stage.
     """
@@ -189,7 +191,9 @@ class Stage(Protocol):
 
     ``consumes`` maps the name of each model parameter the stage accepts to a
     :class:`ParamSpec`. ``compute`` receives every one of them: the value from the
-    parameter space, or the default from the spec.
+    parameter space, or the default from the spec. It is read from the stage instance,
+    so it can be a property that depends on the instance's configuration: the number
+    of terms of a polynomial, say, which sets the length of its coefficient vector.
 
     ``requires`` and ``provides`` map slot names to slots (or bare types). The slot
     names of ``requires`` are the keyword arguments ``compute`` receives, and those of
