@@ -212,6 +212,10 @@ class Stage(Protocol):
     parameter values is inconsistent in a way no single :class:`ParamSpec` can express
     (one parameter bounded by another, say). It must be cheap: :func:`resolve` calls it
     on a few points of the parameter space, without computing anything else.
+
+    A stage may also set ``cacheable = True`` to have a :class:`~yabf.pipeline.Pipeline`
+    keep its outputs across evaluations. This suits stages with small outputs, such as
+    observables, and not simulators.
     """
 
     name: str
