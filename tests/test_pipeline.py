@@ -9,7 +9,7 @@ import pytest
 
 from yabf.params import Param, ParamSpace
 from yabf.pipeline import Pipeline
-from yabf.stages import Slot
+from yabf.stages import REQUIRED, ParamSpec, Slot
 
 
 @attrs.frozen(eq=False)
@@ -30,12 +30,15 @@ class Simulator:
 
     made: list = attrs.field(factory=list, eq=False)
     name: str = "sim"
-    consumes: ClassVar = frozenset({"sigma", "seed"})
+    consumes: ClassVar = {
+        "sigma": ParamSpec(REQUIRED, domain=(0, np.inf)),
+        "seed": ParamSpec(0),
+    }
     requires: ClassVar = {}
     provides: ClassVar = {"field": Field}
 
     def compute(self, params):
-        noise = np.random.default_rng(int(params.get("seed", 0))).standard_normal(10**5)
+        noise = np.random.default_rng(int(params["seed"])).standard_normal(10**5)
         field = Field(params["sigma"] * noise)
         self.made.append(weakref.ref(field))
         return {"field": field}
@@ -48,7 +51,7 @@ class Measure:
     calls: list = attrs.field(factory=list, eq=False)
     name: str = "measure"
     cacheable: ClassVar = True
-    consumes: ClassVar = frozenset()
+    consumes: ClassVar = {}
     requires: ClassVar = {"field": Field}
     provides: ClassVar = {"var": Variance}
 
@@ -62,12 +65,12 @@ class Instrument:
     """A fractional model error applied to the observable."""
 
     name: str = "instrument"
-    consumes: ClassVar = frozenset({"model_error"})
+    consumes: ClassVar = {"model_error": ParamSpec(0.0, domain=(0, np.inf))}
     requires: ClassVar = {"var": Variance}
     provides: ClassVar = {"var": Slot(Variance, "observed")}
 
     def compute(self, params, var):
-        return {"var": Variance(var.value * (1 + params.get("model_error", 0.0)))}
+        return {"var": Variance(var.value * (1 + params["model_error"]))}
 
 
 @attrs.frozen
@@ -75,7 +78,7 @@ class Likelihood:
     """A Gaussian likelihood for an observed variance of one."""
 
     name: str = "like"
-    consumes: ClassVar = frozenset()
+    consumes: ClassVar = {}
     requires: ClassVar = {"var": Slot(Variance, "observed")}
     provides: ClassVar = {"lnl": float}
 
@@ -90,7 +93,7 @@ class FieldsFreed:
     sim: Simulator
     seen: list = attrs.field(factory=list, eq=False)
     name: str = "probe"
-    consumes: ClassVar = frozenset()
+    consumes: ClassVar = {}
     requires: ClassVar = {"var": Slot(Variance, "observed")}
     provides: ClassVar = {"ok": bool}
 

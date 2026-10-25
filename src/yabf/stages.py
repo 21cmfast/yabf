@@ -1,15 +1,18 @@
 """Stages, and the graph that connects them.
 
-A stage is one pure computation. It declares the model parameters it consumes, the
-typed inputs it requires and the typed outputs it provides, and its ``compute`` method
-turns parameters and inputs into outputs. Any object with these attributes is a stage:
+A stage is one pure computation. It declares the model parameters it consumes, each
+with a :class:`ParamSpec`, the typed inputs it requires and the typed outputs it
+provides, and its ``compute`` method turns parameters and inputs into outputs. Any
+object with these attributes is a stage:
 
 .. code-block:: python
 
     @attrs.frozen
     class Smooth:
         name: str = "smooth"
-        consumes = frozenset({"width"})
+        consumes = {
+            "width": ParamSpec(1.0, domain=(0, np.inf), description="Scale, in Mpc."),
+        }
         requires = {"field": Field}
         provides = {"smoothed": Slot(Field, tag="smoothed")}
 
@@ -18,8 +21,8 @@ turns parameters and inputs into outputs. Any object with these attributes is a 
 
 Inputs and outputs are matched by :class:`Slot`, a type and a tag, never by the name
 of the stage that produced them. :func:`resolve` links each requirement to the single
-output that matches it, and reports every problem with the graph before anything is
-computed.
+output that matches it and checks the parameter space against what each stage
+accepts, and reports every problem it finds before anything is computed.
 """
 
 from __future__ import annotations
@@ -29,8 +32,82 @@ from collections.abc import Iterable, Mapping
 from typing import Any, Protocol, runtime_checkable
 
 import attrs
+import numpy as np
 
 from .params import ParamSpace
+
+
+class _Required:
+    def __repr__(self) -> str:
+        return "REQUIRED"
+
+
+REQUIRED = _Required()
+"""The default of a parameter that a stage cannot compute without."""
+
+
+def _domain(value):
+    if value is None:
+        return None
+    low, high = (float(v) for v in value)
+    if not low <= high:
+        raise ValueError(f"A domain needs low <= high, got ({low:g}, {high:g}).")
+    return (low, high)
+
+
+def _fmt(value) -> str:
+    if np.ndim(value) == 0:
+        return f"{float(value):g}"
+    return np.array2string(np.asarray(value), precision=4)
+
+
+@attrs.frozen
+class ParamSpec:
+    """A model parameter that a stage accepts: its default, domain and shape.
+
+    This describes the model, not the inference: it says which values the stage can
+    compute with, not which values are believed to be likely. Priors, fiducial values
+    and labels belong to :class:`~yabf.params.Param`.
+
+    Parameters
+    ----------
+    default
+        The value the stage uses when the parameter space does not define the
+        parameter, or :data:`REQUIRED` if the stage cannot compute without it.
+    domain
+        The closed interval ``(low, high)`` of values the stage accepts (the ends may
+        be infinite), or ``None`` if it accepts any value.
+    shape
+        The shape of the value: ``()`` for a scalar.
+    description
+        What the parameter means, for people reading the stage.
+    """
+
+    default: Any = REQUIRED
+    domain: tuple[float, float] | None = attrs.field(default=None, converter=_domain)
+    shape: tuple[int, ...] = attrs.field(default=(), converter=tuple)
+    description: str = ""
+
+    def __attrs_post_init__(self):
+        """Check that the default is a value the stage accepts."""
+        if not self.required and (why := self.why_not(self.default)):
+            raise ValueError(f"The default {_fmt(self.default)} {why}.")
+
+    @property
+    def required(self) -> bool:
+        """Whether the stage cannot compute without a value for the parameter."""
+        return self.default is REQUIRED
+
+    def why_not(self, value) -> str | None:
+        """Say why the stage does not accept ``value``, or return None if it does."""
+        if np.shape(value) != self.shape:
+            return f"has shape {np.shape(value)}, not {self.shape}"
+        if self.domain is not None:
+            low, high = self.domain
+            v = np.asarray(value, dtype=float)
+            if not np.all((v >= low) & (v <= high)):
+                return f"is outside [{low:g}, {high:g}]"
+        return None
 
 
 @attrs.frozen
@@ -68,11 +145,18 @@ def as_slot(slot) -> Slot:
 class Stage(Protocol):
     """The interface a stage must provide.
 
+    ``consumes`` maps the name of each model parameter the stage accepts to a
+    :class:`ParamSpec`. ``compute`` receives every one of them: the value from the
+    parameter space, or the default from the spec.
+
     ``requires`` and ``provides`` map slot names to slots (or bare types). The slot
     names of ``requires`` are the keyword arguments ``compute`` receives, and those of
-    ``provides`` are the keys of the dictionary it returns. ``consumes`` lists the
-    model parameters the stage accepts; ``compute`` receives those that the parameter
-    space defines, and uses its own defaults for the rest.
+    ``provides`` are the keys of the dictionary it returns.
+
+    A stage may also define ``check(params)``, which raises ``ValueError`` if a set of
+    parameter values is inconsistent in a way no single :class:`ParamSpec` can express
+    (one parameter bounded by another, say). It must be cheap: :func:`resolve` calls it
+    on a few points of the parameter space, without computing anything else.
 
     A stage may also set ``cacheable = True`` to have a :class:`~yabf.pipeline.Pipeline`
     keep its outputs across evaluations. This suits stages with small outputs, such as
@@ -81,7 +165,7 @@ class Stage(Protocol):
     """
 
     name: str
-    consumes: frozenset[str]
+    consumes: Mapping[str, ParamSpec]
     requires: Mapping[str, Slot | type]
     provides: Mapping[str, Slot | type]
 
@@ -162,6 +246,72 @@ def _unused_params(stages, params: ParamSpace) -> list[str]:
     return [_describe_param(p) for p in params.params if p.feeds not in used]
 
 
+def _probes(params: ParamSpace):
+    """Yield points of the parameter space to check the stages at, with a label.
+
+    The points are the fiducial point, each sampled parameter near both edges of its
+    prior (with the others at their fiducial values), and a few draws from the prior.
+    """
+    fiducial = params.fiducial
+    yield "at the fiducial point", fiducial
+    for i, p in enumerate(params.sampled):
+        for side, q in (("lower", 1e-3), ("upper", 1 - 1e-3)):
+            theta = fiducial.copy()
+            theta[i] = p.prior.ppf(q)
+            yield f"with {p.name!r} near the {side} edge of its prior", theta
+    for theta in params.sample_prior(8, np.random.default_rng(0)):
+        yield "at a prior draw", theta
+
+
+def _param_problems(stages, params: ParamSpace) -> list[str]:
+    """Check the parameter space against what each stage accepts, computing nothing."""
+    found: dict[tuple[str, str], str] = {}  # the first problem per stage and parameter
+    by_feeds = {p.feeds: p for p in params.params}
+    for s in stages:
+        for name, spec in s.consumes.items():
+            p = by_feeds.get(name)
+            if p is None and spec.required:
+                found[s.name, name] = (
+                    f"Stage {s.name!r} requires the parameter {name!r}, which the "
+                    "parameter space does not define."
+                )
+            # For a monotonic transform (every built-in one), the support of a prior
+            # maps onto the interval between the model values at its edges. Other
+            # transforms are only checked at the points from _probes below.
+            if p is not None and p.is_sampled:
+                for side, q in (("lower", 0.0), ("upper", 1.0)):
+                    value = p.to_model(p.prior.ppf(q))
+                    if (s.name, name) not in found and (why := spec.why_not(value)):
+                        found[s.name, name] = (
+                            f"Stage {s.name!r} rejects {name!r} at the {side} edge of "
+                            f"the prior of {p.name!r}: the value {_fmt(value)} {why}."
+                        )
+
+    for where, theta in _probes(params):
+        values = params.to_model(theta)
+        for s in stages:
+            if any((s.name, name) in found for name in s.consumes):
+                continue
+            for name, spec in s.consumes.items():
+                if name in values and (why := spec.why_not(values[name])):
+                    found[s.name, name] = (
+                        f"Stage {s.name!r} rejects {name!r} {where}: the value "
+                        f"{_fmt(values[name])} {why}."
+                    )
+            check = getattr(s, "check", None)
+            if check is None or (s.name, "") in found:
+                continue
+            try:
+                check(
+                    {k: values.get(k, spec.default) for k, spec in s.consumes.items()}
+                )
+            except ValueError as e:
+                found[s.name, ""] = (
+                    f"Stage {s.name!r} rejects the parameters {where}: {e}"
+                )
+    return list(found.values())
+
+
 def _link(stages) -> tuple[list[Link], list[str]]:
     """Link every required slot to its provider, and describe the ones that fail."""
     provided = [(s.name, k, slot) for s in stages for k, slot in _provides(s).items()]
@@ -199,13 +349,23 @@ def resolve(stages: Iterable[Stage], params: ParamSpace | None = None) -> StageG
     ------
     GraphError
         Listing every problem found: duplicate stage names, a required slot that no
-        stage or more than one stage provides, a parameter of ``params`` that no stage
-        consumes (directly or through a tie), and cycles.
+        stage or more than one stage provides, and cycles. Given ``params``, also a
+        parameter that no stage consumes (directly or through a tie), a required
+        parameter that ``params`` does not define, and a parameter whose values reach
+        outside what a stage accepts, either at the edges of its prior or at a few
+        points of the parameter space where each stage's ``check`` is also run.
     """
     stages = tuple(stages)
     for s in stages:
         if not isinstance(s, Stage):
             raise TypeError(f"{s!r} is not a stage: see yabf.stages.Stage.")
+        if not isinstance(s.consumes, Mapping) or not all(
+            isinstance(spec, ParamSpec) for spec in s.consumes.values()
+        ):
+            raise TypeError(
+                f"Stage {s.name!r} must declare `consumes` as a mapping from parameter "
+                f"names to ParamSpec, got {s.consumes!r}."
+            )
 
     problems = []
     names = [s.name for s in stages]
@@ -228,6 +388,7 @@ def resolve(stages: Iterable[Stage], params: ParamSpace | None = None) -> StageG
         unused = _unused_params(stages, params)
         if unused:
             problems.append(f"No stage consumes the parameters {', '.join(unused)}.")
+        problems += _param_problems(stages, params)
 
     # Stages are identified by name, so cycles can only be traced once names are unique.
     graph = {n: set() for n in names}
@@ -250,15 +411,24 @@ def call_stage(
 ) -> dict[str, Any]:
     """Compute ``stage`` and check that it returns exactly the slots it provides.
 
-    ``params`` may hold more parameters than the stage consumes; it receives only
-    those it consumes.
+    The stage receives every parameter it consumes: the value in ``params``, or the
+    default from its :class:`ParamSpec`. Other entries of ``params`` are ignored.
 
     Raises
     ------
     StageError
-        If the outputs are not exactly the provided slots, or one has the wrong type.
+        If ``params`` lacks a required parameter, or the outputs are not exactly the
+        provided slots, or one has the wrong type.
     """
-    consumed = {k: v for k, v in params.items() if k in stage.consumes}
+    missing = sorted(
+        k for k, spec in stage.consumes.items() if spec.required and k not in params
+    )
+    if missing:
+        raise StageError(
+            f"Stage {stage.name!r} requires the parameters {missing}, which were not "
+            "given."
+        )
+    consumed = {k: params.get(k, spec.default) for k, spec in stage.consumes.items()}
     out = stage.compute(consumed, **inputs)
     provides = _provides(stage)
     if not isinstance(out, Mapping) or set(out) != set(provides):
