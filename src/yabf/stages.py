@@ -21,8 +21,9 @@ object with these attributes is a stage:
 
 Inputs and outputs are matched by :class:`Slot`, a type and a tag, never by the name
 of the stage that produced them. :func:`resolve` links each requirement to the single
-output that matches it and checks the parameter space against what each stage
-accepts, and reports every problem it finds before anything is computed.
+output that matches it, or, for an :class:`All` requirement, to every output that
+matches it. It also checks the parameter space against what each stage accepts, and
+reports every problem it finds before anything is computed.
 """
 
 from __future__ import annotations
@@ -141,6 +142,43 @@ def as_slot(slot) -> Slot:
     raise TypeError(f"A slot must be a type or a Slot, got {slot!r}.")
 
 
+@attrs.frozen
+class All:
+    """A requirement for every output that matches a slot, from any number of stages.
+
+    A stage that requires ``All(Spectrum, tag="model")`` receives a tuple of every
+    ``Spectrum`` output tagged ``"model"``, in the order the stages were given, without
+    naming the stages that provide them: a residual (data minus every model
+    component) or a sum of components, say. A stage's own outputs never satisfy its
+    ``All`` requirements.
+
+    Parameters
+    ----------
+    type, tag
+        The slot to match, as for :class:`Slot`.
+    min
+        The fewest matching outputs allowed. The default of one catches a mistyped
+        tag; zero allows none.
+    """
+
+    type: type = attrs.field(validator=attrs.validators.instance_of(type))
+    tag: str = attrs.field(default="", validator=attrs.validators.instance_of(str))
+    min: int = attrs.field(default=1, kw_only=True, validator=attrs.validators.ge(0))
+
+    @property
+    def slot(self) -> Slot:
+        """The slot that each matching output satisfies."""
+        return Slot(self.type, self.tag)
+
+    def __str__(self) -> str:
+        """Describe the requirement for error messages."""
+        return f"every {self.slot}"
+
+
+def _as_requirement(req) -> Slot | All:
+    return req if isinstance(req, All) else as_slot(req)
+
+
 @runtime_checkable
 class Stage(Protocol):
     """The interface a stage must provide.
@@ -151,7 +189,8 @@ class Stage(Protocol):
 
     ``requires`` and ``provides`` map slot names to slots (or bare types). The slot
     names of ``requires`` are the keyword arguments ``compute`` receives, and those of
-    ``provides`` are the keys of the dictionary it returns.
+    ``provides`` are the keys of the dictionary it returns. A requirement may also be
+    :class:`All`, for which ``compute`` receives a tuple of every matching output.
 
     A stage may also define ``check(params)``, which raises ``ValueError`` if a set of
     parameter values is inconsistent in a way no single :class:`ParamSpec` can express
@@ -161,7 +200,7 @@ class Stage(Protocol):
 
     name: str
     consumes: Mapping[str, ParamSpec]
-    requires: Mapping[str, Slot | type]
+    requires: Mapping[str, Slot | All | type]
     provides: Mapping[str, Slot | type]
 
     def compute(self, params: Mapping[str, Any], **inputs) -> dict[str, Any]:
@@ -169,8 +208,8 @@ class Stage(Protocol):
         ...
 
 
-def _requires(stage) -> dict[str, Slot]:
-    return {k: as_slot(v) for k, v in stage.requires.items()}
+def _requires(stage) -> dict[str, Slot | All]:
+    return {k: _as_requirement(v) for k, v in stage.requires.items()}
 
 
 def _provides(stage) -> dict[str, Slot]:
@@ -211,13 +250,38 @@ class StageGraph:
     stages: tuple[Stage, ...]
     links: tuple[Link, ...]
 
-    def inputs_of(self, name: str) -> dict[str, tuple[str, str]]:
-        """Map each required slot of stage ``name`` to its ``(provider, slot)``."""
+    def inputs_of(self, name: str) -> dict[str, tuple[tuple[str, str], ...]]:
+        """Map each required slot of stage ``name`` to the outputs that feed it.
+
+        Outputs are ``(stage, slot)`` pairs: one for an ordinary requirement, any
+        number for an :class:`All` requirement.
+        """
+        inputs: dict[str, tuple[tuple[str, str], ...]] = dict.fromkeys(
+            self._stage(name).requires, ()
+        )
+        for link in self.links:
+            if link.stage == name:
+                inputs[link.slot] += ((link.provider, link.provided),)
+        return inputs
+
+    def gather(
+        self, name: str, outputs: Mapping[tuple[str, str], Any]
+    ) -> dict[str, Any]:
+        """Collect the inputs of stage ``name`` from ``outputs``, keyed by slot name.
+
+        ``outputs`` maps ``(stage, slot)`` pairs to computed values. An :class:`All`
+        requirement receives a tuple of its values.
+        """
+        requires = _requires(self._stage(name))
         return {
-            link.slot: (link.provider, link.provided)
-            for link in self.links
-            if link.stage == name
+            k: tuple(outputs[src] for src in srcs)
+            if isinstance(requires[k], All)
+            else outputs[srcs[0]]
+            for k, srcs in self.inputs_of(name).items()
         }
+
+    def _stage(self, name: str) -> Stage:
+        return next(s for s in self.stages if s.name == name)
 
 
 def _describe_param(p) -> str:
@@ -313,6 +377,22 @@ def _link(stages) -> tuple[list[Link], list[str]]:
     links, problems = [], []
     for s in stages:
         for k, need in _requires(s).items():
+            if isinstance(need, All):
+                matches = [
+                    (name, slot)
+                    for name, slot, have in provided
+                    if name != s.name and have.satisfies(need.slot)
+                ]
+                links.extend(Link(s.name, k, *m) for m in matches)
+                if len(matches) < need.min:
+                    found = "1 stage provides" if matches else "no stage provides"
+                    if len(matches) > 1:
+                        found = f"{len(matches)} stages provide"
+                    problems.append(
+                        f"Stage {s.name!r} requires {need} (slot {k!r}), at least "
+                        f"{need.min}, but {found} one."
+                    )
+                continue
             matches = [
                 (name, slot) for name, slot, have in provided if have.satisfies(need)
             ]
