@@ -593,12 +593,19 @@ def test_all_with_min_zero_accepts_no_matches():
 
 @attrs.frozen
 class Polynomial:
-    """A polynomial with four coefficients, each between -100 and 100."""
+    """A polynomial with ``n`` coefficients, each between -100 and 100.
 
+    The class works for any number of terms; each instance fixes its own.
+    """
+
+    n: int = 4
     name: str = "poly"
-    consumes: ClassVar = {"p": ParamSpec(REQUIRED, shape=(4,), domain=(-100, 100))}
     requires: ClassVar = {}
     provides: ClassVar = {"spectrum": Slot(Spectrum, "model")}
+
+    @property
+    def consumes(self):
+        return {"p": ParamSpec(REQUIRED, shape=(self.n,), domain=(-100, 100))}
 
     def compute(self, params):
         return {"spectrum": Spectrum(np.polyval(params["p"][::-1], FREQS / 75))}
@@ -642,3 +649,12 @@ def test_a_vector_of_elements_feeds_a_vector_parameter():
 )
 def test_vectors_a_stage_does_not_accept_are_reported(params, expected):
     assert expected in _problems([Polynomial()], ParamSpace(params))
+
+
+@pytest.mark.parametrize("n", [2, 5])
+def test_each_instance_of_a_stage_sets_the_length_of_its_vectors(n):
+    params = ParamSpace(param_vector("p", n, prior=(-10.0, 10.0)))
+    resolve([Polynomial(n)], params)
+    other = Polynomial(n + 1)
+    (problem,) = _problems([other], params)
+    assert problem.endswith(f"has shape ({n},), not ({n + 1},).")
