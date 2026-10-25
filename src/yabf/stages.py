@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import graphlib
 from collections.abc import Iterable, Mapping
+from functools import cached_property
 from typing import Any, Protocol, runtime_checkable
 
 import attrs
@@ -261,13 +262,7 @@ class StageGraph:
         Outputs are ``(stage, slot)`` pairs: one for an ordinary requirement, any
         number for an :class:`All` requirement.
         """
-        inputs: dict[str, tuple[tuple[str, str], ...]] = dict.fromkeys(
-            self._stage(name).requires, ()
-        )
-        for link in self.links:
-            if link.stage == name:
-                inputs[link.slot] += ((link.provider, link.provided),)
-        return inputs
+        return dict(self._inputs[name])
 
     def gather(
         self, name: str, outputs: Mapping[tuple[str, str], Any]
@@ -277,16 +272,25 @@ class StageGraph:
         ``outputs`` maps ``(stage, slot)`` pairs to computed values. An :class:`All`
         requirement receives a tuple of its values.
         """
-        requires = _requires(self._stage(name))
+        requires = self._requirements[name]
         return {
             k: tuple(outputs[src] for src in srcs)
             if isinstance(requires[k], All)
             else outputs[srcs[0]]
-            for k, srcs in self.inputs_of(name).items()
+            for k, srcs in self._inputs[name].items()
         }
 
-    def _stage(self, name: str) -> Stage:
-        return next(s for s in self.stages if s.name == name)
+    # Lookups computed once per graph: a pipeline uses them on every evaluation.
+    @cached_property
+    def _requirements(self) -> dict[str, dict[str, Slot | All]]:
+        return {s.name: _requires(s) for s in self.stages}
+
+    @cached_property
+    def _inputs(self) -> dict[str, dict[str, tuple[tuple[str, str], ...]]]:
+        inputs = {s.name: dict.fromkeys(s.requires, ()) for s in self.stages}
+        for link in self.links:
+            inputs[link.stage][link.slot] += ((link.provider, link.provided),)
+        return inputs
 
 
 def _describe_param(p) -> str:

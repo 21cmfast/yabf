@@ -9,7 +9,7 @@ import pytest
 
 from yabf.params import Param, ParamSpace
 from yabf.pipeline import Pipeline
-from yabf.stages import REQUIRED, ParamSpec, Slot
+from yabf.stages import REQUIRED, All, ParamSpec, Slot
 
 
 @attrs.frozen(eq=False)
@@ -216,3 +216,74 @@ def test_unknown_outputs_are_rejected():
     pipe, _, _ = _chain()
     with pytest.raises(ValueError, match=r"no outputs \[\('like', 'chi2'\)\]"):
         pipe(PARAMS, want=[("like", "chi2")])
+
+
+FREQS = np.linspace(50.0, 100.0, 1001)
+
+
+@attrs.frozen(eq=False)
+class Spectrum:
+    values: np.ndarray
+
+
+@attrs.frozen
+class Component:
+    """A cached power-law component; keeps a weak reference to each spectrum."""
+
+    name: str
+    index: float = -2.5
+    made: list = attrs.field(factory=list, eq=False)
+    cacheable: ClassVar = True
+    requires: ClassVar = {}
+    provides: ClassVar = {"spectrum": Slot(Spectrum, "model")}
+
+    @property
+    def consumes(self):
+        return {f"{self.name}_amp": ParamSpec(REQUIRED)}
+
+    def compute(self, params):
+        spectrum = Spectrum(params[f"{self.name}_amp"] * (FREQS / 75) ** self.index)
+        self.made.append(weakref.ref(spectrum))
+        return {"spectrum": spectrum}
+
+
+@attrs.frozen
+class Residual:
+    """The data minus every model component."""
+
+    data: np.ndarray = attrs.field(eq=False)
+    cacheable: bool = False
+    name: str = "residual"
+    consumes: ClassVar = {}
+    requires: ClassVar = {"parts": All(Spectrum, "model")}
+    provides: ClassVar = {"chi2": float}
+
+    def compute(self, params, parts):
+        return {"chi2": float(np.sum((self.data - sum(p.values for p in parts)) ** 2))}
+
+
+def _components():
+    return [Component("fg", -2.5), Component("bias", 0.0), Component("tilt", 1.0)]
+
+
+def test_changing_one_component_recomputes_only_that_component():
+    # The residual is cached too, so its key must depend on every component.
+    components = _components()
+    pipe = Pipeline.build([Residual(np.zeros_like(FREQS), True), *components])
+    params = {"fg_amp": 1000.0, "bias_amp": 1.0, "tilt_amp": 0.1}
+    pipe(params)
+    changed = params | {"tilt_amp": 0.2}
+    out = pipe(changed)
+    assert [len(c.made) for c in components] == [1, 1, 2]
+
+    fresh = Pipeline.build(
+        [Residual(np.zeros_like(FREQS)), *_components()], cache_size=0
+    )
+    assert out == fresh(changed)
+
+
+def test_every_component_is_freed_once_the_residual_has_used_it():
+    components = _components()
+    pipe = Pipeline.build([Residual(np.zeros_like(FREQS)), *components], cache_size=0)
+    pipe({"fg_amp": 1000.0, "bias_amp": 1.0, "tilt_amp": 0.1})
+    assert all(ref() is None for c in components for ref in c.made)
