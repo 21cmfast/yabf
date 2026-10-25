@@ -104,6 +104,9 @@ class ParamSpec:
         """Say why the stage does not accept ``value``, or return None if it does."""
         if np.shape(value) != self.shape:
             return f"has shape {np.shape(value)}, not {self.shape}"
+        return self._outside_domain(value)
+
+    def _outside_domain(self, value) -> str | None:
         if self.domain is not None:
             low, high = self.domain
             v = np.asarray(value, dtype=float)
@@ -334,22 +337,28 @@ def _probes(params: ParamSpace):
 def _param_problems(stages, params: ParamSpace) -> list[str]:
     """Check the parameter space against what each stage accepts, computing nothing."""
     found: dict[tuple[str, str], str] = {}  # the first problem per stage and parameter
-    by_feeds = {p.feeds: p for p in params.params}
+    by_feeds: dict[str, list] = {}  # several parameters feed a vector's elements
+    for p in params.params:
+        by_feeds.setdefault(p.feeds, []).append(p)
     for s in stages:
         for name, spec in s.consumes.items():
-            p = by_feeds.get(name)
-            if p is None and spec.required:
+            if name not in by_feeds and spec.required:
                 found[s.name, name] = (
                     f"Stage {s.name!r} requires the parameter {name!r}, which the "
                     "parameter space does not define."
                 )
             # For a monotonic transform (every built-in one), the support of a prior
             # maps onto the interval between the model values at its edges. Other
-            # transforms are only checked at the points from _probes below.
-            if p is not None and p.is_sampled:
+            # transforms are only checked at the points from _probes below. An
+            # element of a vector is checked against the domain only; the vector's
+            # shape is checked at those points.
+            for p in by_feeds.get(name, []):
+                if not p.is_sampled:
+                    continue
+                check = spec.why_not if p.index is None else spec._outside_domain
                 for side, q in (("lower", 0.0), ("upper", 1.0)):
                     value = p.to_model(p.prior.ppf(q))
-                    if (s.name, name) not in found and (why := spec.why_not(value)):
+                    if (s.name, name) not in found and (why := check(value)):
                         found[s.name, name] = (
                             f"Stage {s.name!r} rejects {name!r} at the {side} edge of "
                             f"the prior of {p.name!r}: the value {_fmt(value)} {why}."

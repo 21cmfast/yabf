@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from yabf import priors
-from yabf.params import Param, ParamSpace
+from yabf.params import Param, ParamSpace, param_vector
 from yabf.stages import (
     REQUIRED,
     All,
@@ -589,3 +589,56 @@ def test_too_few_matches_for_all_are_reported(min_parts, n_components, expected)
 def test_all_with_min_zero_accepts_no_matches():
     out = _run(resolve([Residual(FREQS, min_parts=0)]), {})
     np.testing.assert_array_equal(out["residual", "residual"].values, FREQS)
+
+
+@attrs.frozen
+class Polynomial:
+    """A polynomial with four coefficients, each between -100 and 100."""
+
+    name: str = "poly"
+    consumes: ClassVar = {"p": ParamSpec(REQUIRED, shape=(4,), domain=(-100, 100))}
+    requires: ClassVar = {}
+    provides: ClassVar = {"spectrum": Slot(Spectrum, "model")}
+
+    def compute(self, params):
+        return {"spectrum": Spectrum(np.polyval(params["p"][::-1], FREQS / 75))}
+
+
+def test_a_vector_of_elements_feeds_a_vector_parameter():
+    params = ParamSpace(param_vector("p", 4, prior=(-10.0, 10.0), fixed={1: 0.0}))
+    out = _run(resolve([Polynomial()], params), params.to_model(params.fiducial))
+    expected = np.polyval([0.0, 0.0, 0.0, 0.0], FREQS / 75)
+    np.testing.assert_allclose(out["poly", "spectrum"].values, expected)
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        (
+            param_vector("p", 3, prior=(-10.0, 10.0)),
+            (
+                "Stage 'poly' rejects 'p' at the fiducial point: the value [0. 0. 0.] "
+                "has shape (3,), not (4,)."
+            ),
+        ),
+        (
+            param_vector("p", 4, prior=[(-10, 10), (-10, 10), (-10, 200), (-10, 10)]),
+            (
+                "Stage 'poly' rejects 'p' at the upper edge of the prior of 'p_2': the "
+                "value 200 is outside [-100, 100]."
+            ),
+        ),
+        (
+            # A multivariate normal has infinite support, so its elements leave the
+            # bounded domain.
+            param_vector("p", prior=priors.multivariate_normal(np.zeros(4), np.eye(4))),
+            (
+                "Stage 'poly' rejects 'p' at the lower edge of the prior of 'p_0': the "
+                "value -inf is outside [-100, 100]."
+            ),
+        ),
+    ],
+    ids=["wrong_length", "element_prior_outside_domain", "joint_prior_unbounded"],
+)
+def test_vectors_a_stage_does_not_accept_are_reported(params, expected):
+    assert expected in _problems([Polynomial()], ParamSpace(params))
