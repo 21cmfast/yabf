@@ -73,6 +73,10 @@ class Stage(Protocol):
     ``provides`` are the keys of the dictionary it returns. ``consumes`` lists the
     model parameters the stage accepts; ``compute`` receives those that the parameter
     space defines, and uses its own defaults for the rest.
+
+    A stage may also set ``cacheable = True`` to have a :class:`~yabf.pipeline.Pipeline`
+    keep its outputs across evaluations. This suits stages with small outputs, such as
+    observables, and not simulators.
     """
 
     name: str
