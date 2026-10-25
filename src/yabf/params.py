@@ -9,6 +9,11 @@ A tied parameter is computed from other model parameters by a named relation, su
 ``equal`` or ``linear``. Relations are named, like transforms, so that a parameter
 space can be written to and read from a configuration file.
 
+A model parameter can also be a vector: each of its elements is fed by its own
+parameter, and :func:`param_vector` builds them, ``beta_0``, ``beta_1``, ... for a
+vector ``beta``. Parameters can share a joint prior, such as a multivariate normal: each
+takes a :class:`~yabf.priors.Marginal` of it as its prior.
+
 A :class:`ParamSpace` is an ordered collection of parameters. It provides what samplers
 need, vectorised over any leading batch dimensions: the prior transform from the unit
 hypercube, the log prior density, draws from the prior and a Gaussian ball around the
@@ -19,11 +24,12 @@ from __future__ import annotations
 
 import graphlib
 from collections.abc import Callable, Mapping, Sequence
+from functools import cached_property
 
 import attrs
 import numpy as np
 
-from .priors import Prior, as_prior
+from .priors import JointPrior, Marginal, Prior, as_prior
 
 
 @attrs.frozen
@@ -227,6 +233,10 @@ class Param:
         median of the prior; not defined for a tied parameter.
     feeds
         The model parameter this one determines. Defaults to ``name``.
+    index
+        If given, this parameter determines element ``index`` of the vector model
+        parameter ``feeds``, whose elements are all fed by parameters of the same
+        space. A tied parameter cannot be an element.
     transform
         The name of a registered transform applied before the value reaches the model.
     latex
@@ -243,6 +253,11 @@ class Param:
     tied: Tie | None = attrs.field(default=None, converter=_optional_tie, kw_only=True)
     fiducial: float = attrs.field(converter=float, kw_only=True)
     feeds: str = attrs.field(kw_only=True)
+    index: int | None = attrs.field(
+        default=None,
+        kw_only=True,
+        validator=attrs.validators.optional(attrs.validators.ge(0)),
+    )
     transform: str = attrs.field(
         default="identity", validator=_check_transform, kw_only=True
     )
@@ -276,6 +291,11 @@ class Param:
             raise ValueError(
                 f"Parameter '{self.name}' is tied, so its value comes from its "
                 "relation and it takes no transform."
+            )
+        if self.is_tied and self.index is not None:
+            raise ValueError(
+                f"Parameter '{self.name}' is tied, so it cannot be an element of a "
+                "vector; tie the whole vector instead."
             )
         if self.prior is not None and not self.prior.logpdf(self.fiducial) > -np.inf:
             raise ValueError(
@@ -311,6 +331,53 @@ def _unique(kind: str, values: Sequence[str]):
         raise ValueError(f"Duplicate parameter {kind}: {sorted(dupes)}.")
 
 
+def _check_feeds(params: Sequence[Param]):
+    """Check that each model parameter is fed once, or element by element."""
+    by_feeds: dict[str, list[Param]] = {}
+    for p in params:
+        by_feeds.setdefault(p.feeds, []).append(p)
+    _unique("feeds", [p.feeds for p in params if p.index is None])
+    for feeds, ps in by_feeds.items():
+        indices = sorted(p.index for p in ps if p.index is not None)
+        if indices and len(indices) < len(ps):
+            raise ValueError(
+                f"Model parameter '{feeds}' is fed both whole and element by element."
+            )
+        if indices and indices != list(range(len(ps))):
+            raise ValueError(
+                f"The elements of model parameter '{feeds}' must have the indices 0 to "
+                f"{len(ps) - 1}, each once; got {indices}."
+            )
+
+
+def _joint_groups(sampled: Sequence[Param]) -> list[tuple[JointPrior, list[int]]]:
+    """Group the sampled parameters that share a joint prior.
+
+    Returns each joint prior with the positions of its parameters among ``sampled``,
+    in the order of the joint prior's own parameters.
+    """
+    groups: dict[int, tuple[JointPrior, dict[int, int]]] = {}
+    for col, p in enumerate(sampled):
+        if isinstance(p.prior, Marginal):
+            joint, cols = groups.setdefault(id(p.prior.joint), (p.prior.joint, {}))
+            if p.prior.index in cols:
+                raise ValueError(
+                    f"Two parameters take marginal {p.prior.index} of the same joint "
+                    f"prior, including '{p.name}'."
+                )
+            cols[p.prior.index] = col
+    out = []
+    for joint, cols in groups.values():
+        if sorted(cols) != list(range(joint.dim)):
+            names = [sampled[c].name for c in cols.values()]
+            raise ValueError(
+                f"The joint prior of {names} covers {joint.dim} parameters, so all of "
+                f"them must be sampled; only its marginals {sorted(cols)} are."
+            )
+        out.append((joint, [cols[i] for i in range(joint.dim)]))
+    return out
+
+
 def _tie_order(params: Sequence[Param]) -> tuple[Param, ...]:
     """Order the tied parameters so that each comes after the ties it depends on."""
     tied = {p.feeds: p for p in params if p.is_tied}
@@ -339,7 +406,9 @@ class ParamSpace:
     vectorised over the leading dimensions.
 
     A tie's inputs must be model parameters fed by parameters in the space, and ties
-    may depend on other ties as long as they do not form a cycle.
+    may depend on other ties as long as they do not form a cycle. The elements of a
+    vector model parameter must all be in the space, and so must every parameter of a
+    joint prior, sampled.
     """
 
     params: tuple[Param, ...] = attrs.field(converter=tuple)
@@ -350,8 +419,19 @@ class ParamSpace:
             if not isinstance(p, Param):
                 raise TypeError(f"Expected Param instances, got {p!r}.")
         _unique("names", [p.name for p in value])
-        _unique("feeds", [p.feeds for p in value])
+        _check_feeds(value)
         _tie_order(value)
+        _joint_groups([p for p in value if p.is_sampled])
+
+    @cached_property
+    def _joint(self) -> list[tuple[JointPrior, list[int]]]:
+        return _joint_groups(self.sampled)
+
+    @cached_property
+    def _independent(self) -> list[int]:
+        return [
+            i for i, p in enumerate(self.sampled) if not isinstance(p.prior, Marginal)
+        ]
 
     @property
     def sampled(self) -> tuple[Param, ...]:
@@ -394,27 +474,45 @@ class ParamSpace:
     def prior_transform(self, u) -> np.ndarray:
         """Map points of the unit hypercube to the sampled parameters."""
         u = self._check_shape(u, "u")
-        columns = [p.prior.ppf(u[..., i]) for i, p in enumerate(self.sampled)]
-        return np.stack(columns, axis=-1) if columns else np.empty(u.shape)
+        out = np.empty(u.shape)
+        for i in self._independent:
+            out[..., i] = self.sampled[i].prior.ppf(u[..., i])
+        for joint, cols in self._joint:
+            out[..., cols] = joint.transform(u[..., cols])
+        return out
 
     def log_prior(self, theta) -> np.ndarray | float:
         """The log prior density of the sampled parameters (``-inf`` outside it)."""
         theta = self._check_shape(theta, "theta")
-        return sum(
-            (p.prior.logpdf(theta[..., i]) for i, p in enumerate(self.sampled)),
-            start=np.zeros(theta.shape[:-1]),
-        )
+        total = np.zeros(theta.shape[:-1])
+        for i in self._independent:
+            total = total + self.sampled[i].prior.logpdf(theta[..., i])
+        for joint, cols in self._joint:
+            total = total + joint.logpdf(theta[..., cols])
+        return total
 
     def to_model(self, theta) -> dict[str, np.ndarray]:
         """Return the model parameters for ``theta``, keyed by the names they feed.
 
         Sampled values are transformed, fixed values are broadcast to the batch shape
-        of ``theta``, and tied values are computed from the others.
+        of ``theta``, the elements of each vector are stacked along a last axis, and
+        tied values are computed from the others.
         """
         theta = self._check_shape(theta, "theta")
-        out = {p.feeds: p.to_model(theta[..., i]) for i, p in enumerate(self.sampled)}
+        out, elements = {}, {}
+
+        def put(p, value):
+            if p.index is None:
+                out[p.feeds] = value
+            else:
+                elements.setdefault(p.feeds, {})[p.index] = value
+
+        for i, p in enumerate(self.sampled):
+            put(p, p.to_model(theta[..., i]))
         for p in self.fixed:
-            out[p.feeds] = np.broadcast_to(p.to_model(p.fixed), theta.shape[:-1])
+            put(p, np.broadcast_to(p.to_model(p.fixed), theta.shape[:-1]))
+        for feeds, values in elements.items():
+            out[feeds] = np.stack([values[i] for i in range(len(values))], axis=-1)
         for p in _tie_order(self.params):
             out[p.feeds] = p.tied(out)
         return out
@@ -464,3 +562,102 @@ class ParamSpace:
             f"Could not draw {n} points inside the prior after {max_tries} tries; "
             "the ball is too wide for the prior or its centre is on the prior's edge."
         )
+
+
+def _element(value, i: int):
+    """Return element ``i`` of a per-element sequence, or ``value`` if it is shared."""
+    return value[i] if np.ndim(value) == 1 else value
+
+
+def param_vector(
+    name: str,
+    length: int | None = None,
+    *,
+    prior=None,
+    fixed=None,
+    fiducial=None,
+    feeds: str | None = None,
+    transform: str = "identity",
+    latex: str | None = None,
+) -> tuple[Param, ...]:
+    """Build the parameters that feed the elements of a vector model parameter.
+
+    Element ``i`` is the parameter ``f"{name}_{i}"``, feeding element ``i`` of the
+    model parameter ``feeds`` (default: ``name``).
+
+    Parameters
+    ----------
+    name
+        The name of the vector.
+    length
+        The number of elements. It may be left out if another argument gives it.
+    prior
+        The prior of the sampled elements: one prior (or ``(low, high)`` tuple) for
+        every element, a list with one per element, or a
+        :class:`~yabf.priors.JointPrior` over all of them, such as a multivariate
+        normal.
+    fixed
+        Fixed elements: a mapping from element index to value, the other elements
+        being sampled, or a sequence fixing every element.
+    fiducial
+        The fiducial value of the sampled elements: one value, or one per element.
+    feeds, transform, latex
+        As for :class:`Param`; ``latex`` gets the element index as a subscript.
+
+    Examples
+    --------
+    A five-term polynomial whose second term is fixed at zero:
+
+    >>> params = param_vector("p", 5, prior=(-1e4, 1e4), fixed={1: 0.0})
+    """
+    lengths = set()
+    if length is not None:
+        lengths.add(length)
+    if isinstance(prior, JointPrior):
+        lengths.add(prior.dim)
+    if isinstance(prior, list):
+        lengths.add(len(prior))
+    if fixed is not None and not isinstance(fixed, Mapping):
+        lengths.add(len(fixed))
+    if np.ndim(fiducial) == 1:
+        lengths.add(len(fiducial))
+    if len(lengths) != 1:
+        raise ValueError(
+            f"The length of vector '{name}' must be given, or follow from its other "
+            f"arguments, and be consistent; got {sorted(lengths) or 'none'}."
+        )
+    (n,) = lengths
+
+    fixed = (
+        {}
+        if fixed is None
+        else dict(fixed if isinstance(fixed, Mapping) else enumerate(fixed))
+    )
+    if isinstance(prior, JointPrior) and fixed:
+        raise ValueError(
+            f"A joint prior needs every element of '{name}' sampled; fix none of them."
+        )
+
+    params = []
+    for i in range(n):
+        kw = {
+            "feeds": feeds or name,
+            "index": i,
+            "transform": transform,
+            "latex": f"{latex or name}_{{{i}}}",
+        }
+        if i in fixed:
+            params.append(Param(f"{name}_{i}", fixed=fixed[i], **kw))
+            continue
+        if prior is None:
+            raise ValueError(f"Element {i} of '{name}' needs a prior or a fixed value.")
+        if isinstance(prior, JointPrior):
+            element_prior = Marginal(prior, i)
+        elif isinstance(prior, list):
+            element_prior = prior[i]
+        else:
+            element_prior = prior
+        if fiducial is not None:
+            kw["fiducial"] = _element(fiducial, i)
+        params.append(Param(f"{name}_{i}", prior=element_prior, **kw))
+    return tuple(params)
