@@ -68,3 +68,65 @@ def test_invalid_parameters_raise(factory, args):
 def test_as_prior_rejects_non_priors(bad):
     with pytest.raises(TypeError, match="logpdf"):
         priors.as_prior(bad)
+
+
+MVN = priors.multivariate_normal(
+    [1.0, -2.0, 0.5],
+    [[1.0, 0.6, 0.2], [0.6, 2.0, -0.3], [0.2, -0.3, 0.5]],
+)
+
+
+def test_joint_logpdf_matches_the_jacobian_of_its_transform():
+    # x = T(u) with u uniform on the unit cube has density 1 / |det dT/du|.
+    rng = np.random.default_rng(0)
+    h = 1e-6
+    for u in rng.uniform(0.05, 0.95, size=(20, MVN.dim)):
+        jac = np.stack(
+            [
+                (MVN.transform(u + h * e) - MVN.transform(u - h * e)) / (2 * h)
+                for e in np.eye(MVN.dim)
+            ],
+            axis=-1,
+        )
+        _, logdet = np.linalg.slogdet(jac)
+        np.testing.assert_allclose(MVN.logpdf(MVN.transform(u)), -logdet, atol=1e-5)
+
+
+def test_joint_transform_draws_have_the_prior_mean_and_covariance():
+    n = 50_000
+    x = MVN.transform(np.random.default_rng(1).uniform(size=(n, MVN.dim)))
+    se = np.sqrt(np.diag(MVN.cov) / n)
+    assert np.all(np.abs(x.mean(axis=0) - MVN.mean) < 5 * se)
+    # The sampling error of a covariance element is about sqrt(2/n) times its scale.
+    np.testing.assert_allclose(np.cov(x.T), MVN.cov, atol=5 * np.sqrt(2 / n) * 2.0)
+
+
+def test_joint_logpdf_matches_scipy_over_a_batch():
+    x = np.random.default_rng(2).normal(size=(4, 5, MVN.dim))
+    expected = stats.multivariate_normal(MVN.mean, MVN.cov).logpdf(x)
+    np.testing.assert_allclose(MVN.logpdf(x), expected)
+
+
+def test_marginals_follow_the_joint_draws():
+    x = MVN.transform(np.random.default_rng(3).uniform(size=(4000, MVN.dim)))
+    for i, marginal in enumerate(MVN.marginals):
+        assert stats.kstest(x[:, i], marginal.cdf).pvalue > 1e-3
+
+
+@pytest.mark.parametrize(
+    ("mean", "cov", "match"),
+    [
+        ([0.0, 0.0], [[1.0, 0.5], [0.0, 1.0]], "symmetric"),
+        ([0.0, 0.0], [[1.0, 2.0], [2.0, 1.0]], "positive-definite"),
+        ([0.0, 0.0], np.eye(3), "matching size"),
+    ],
+    ids=["asymmetric", "not_positive_definite", "wrong_size"],
+)
+def test_invalid_multivariate_normals_are_rejected(mean, cov, match):
+    with pytest.raises(ValueError, match=match):
+        priors.multivariate_normal(mean, cov)
+
+
+def test_a_joint_prior_is_not_a_single_parameter_prior():
+    with pytest.raises(TypeError, match="Marginal"):
+        priors.as_prior(MVN)
