@@ -115,8 +115,8 @@ class Pipeline:
                     if k in by_name[name].consumes
                 )
                 upstream = sorted(
-                    (slot, key(provider))
-                    for slot, (provider, _) in self.graph.inputs_of(name).items()
+                    (slot, tuple(key(provider) for provider, _ in srcs))
+                    for slot, srcs in self.graph.inputs_of(name).items()
                 )
                 keys[name] = (name, tuple(consumed), tuple(upstream))
             return keys[name]
@@ -136,14 +136,18 @@ class Pipeline:
                 hits[name] = cached
                 return
             run.add(name)
-            for provider, _ in self.graph.inputs_of(name).values():
-                need(provider)
+            for srcs in self.graph.inputs_of(name).values():
+                for provider, _ in srcs:
+                    need(provider)
 
         for name, _ in want:
             need(name)
 
         remaining = Counter(
-            src for name in run for src in self.graph.inputs_of(name).values()
+            src
+            for name in run
+            for srcs in self.graph.inputs_of(name).values()
+            for src in srcs
         )
         store = {
             (name, slot): value
@@ -161,10 +165,7 @@ class Pipeline:
 
     def _run(self, stage, params, store, remaining, wanted, key) -> None:
         """Compute one stage, then release the inputs that nothing else needs."""
-        links = self.graph.inputs_of(stage.name)
-        out = call_stage(
-            stage, params, {slot: store[src] for slot, src in links.items()}
-        )
+        out = call_stage(stage, params, self.graph.gather(stage.name, store))
         if self._cacheable(stage):
             self._cache[key(stage.name)] = out
             while len(self._cache) > self.cache_size:
@@ -172,10 +173,11 @@ class Pipeline:
         for slot, value in out.items():
             if (stage.name, slot) in wanted or remaining[stage.name, slot]:
                 store[stage.name, slot] = value
-        for src in links.values():
-            remaining[src] -= 1
-            if not remaining[src] and src not in wanted:
-                del store[src]
+        for srcs in self.graph.inputs_of(stage.name).values():
+            for src in srcs:
+                remaining[src] -= 1
+                if not remaining[src] and src not in wanted:
+                    del store[src]
 
     def _check_want(self, want) -> tuple[Output, ...]:
         if want is None:
