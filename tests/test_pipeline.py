@@ -160,8 +160,10 @@ def test_only_changes_upstream_of_the_cached_observable_re_simulate(
 ):
     pipe, sim, _ = _chain()
     pipe(PARAMS)
-    pipe(PARAMS | change)
+    out = pipe(PARAMS | change)
     assert len(sim.made) == simulations
+    fresh, _, _ = _chain(cache_size=0)
+    assert out == fresh(PARAMS | change)
 
 
 def test_cached_results_equal_freshly_computed_ones():
@@ -197,9 +199,14 @@ def test_cache_keys_accept_values_from_a_parameter_space():
         ]
     )
     pipe, sim, _ = _chain()
-    for model_error in [0.1, 0.3]:
-        pipe(space.to_model(np.array([1.2, model_error])))
-    assert len(sim.made) == 1
+    fresh, _, _ = _chain(cache_size=0)
+    points = [[1.2, 0.1], [1.2, 0.3], [1.5, 0.3], [1.2, 0.3]]
+    for theta in points:
+        values = space.to_model(np.array(theta))
+        assert pipe(values) == fresh(values)
+    # Re-simulated for each new sigma, but not when only model_error changes, nor
+    # when an earlier point comes back.
+    assert len(sim.made) == 2
 
 
 def test_unknown_outputs_are_rejected():

@@ -49,7 +49,7 @@ class Pipeline:
     Build one from stages with :meth:`build`, then call it with the values of the
     model parameters and the outputs wanted, each named by its ``(stage, slot)``
     pair. Stages must not change between evaluations, and must not modify their
-    inputs.
+    inputs. A pipeline evaluates one point at a time and is not thread-safe.
 
     Parameters
     ----------
@@ -128,9 +128,12 @@ class Pipeline:
         def need(name: str) -> None:
             if name in run or name in hits:
                 return
-            if self._cacheable(by_name[name]) and key(name) in self._cache:
+            cached = (
+                self._cache.get(key(name)) if self._cacheable(by_name[name]) else None
+            )
+            if cached is not None:
                 self._cache.move_to_end(key(name))
-                hits[name] = self._cache[key(name)]
+                hits[name] = cached
                 return
             run.add(name)
             for provider, _ in self.graph.inputs_of(name).values():

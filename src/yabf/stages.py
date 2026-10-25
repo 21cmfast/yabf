@@ -76,7 +76,8 @@ class Stage(Protocol):
 
     A stage may also set ``cacheable = True`` to have a :class:`~yabf.pipeline.Pipeline`
     keep its outputs across evaluations. This suits stages with small outputs, such as
-    observables, and not simulators.
+    observables, and not simulators. A cached output must not refer to the stage's
+    inputs (a NumPy view of an input field, say), or it keeps them alive.
     """
 
     name: str
