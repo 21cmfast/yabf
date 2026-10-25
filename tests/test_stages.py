@@ -12,6 +12,7 @@ from yabf import priors
 from yabf.params import Param, ParamSpace
 from yabf.stages import (
     REQUIRED,
+    All,
     GraphError,
     ParamSpec,
     Slot,
@@ -93,11 +94,8 @@ def _run(graph, params):
     """Compute every stage of a resolved graph in order."""
     outputs = {}
     for stage in graph.stages:
-        inputs = {
-            slot: outputs[provider][provided]
-            for slot, (provider, provided) in graph.inputs_of(stage.name).items()
-        }
-        outputs[stage.name] = call_stage(stage, params, inputs)
+        out = call_stage(stage, params, graph.gather(stage.name, outputs))
+        outputs.update({(stage.name, slot): value for slot, value in out.items()})
     return outputs
 
 
@@ -112,16 +110,16 @@ TOY = (Simulator(), Measure(), Likelihood())
 def test_stages_are_ordered_after_their_providers_whatever_the_input_order(stages):
     graph = resolve(stages)
     assert [s.name for s in graph.stages] == ["sim", "measure", "like"]
-    assert graph.inputs_of("measure") == {"field": ("sim", "field")}
-    assert graph.inputs_of("like") == {"var": ("measure", "var")}
+    assert graph.inputs_of("measure") == {"field": (("sim", "field"),)}
+    assert graph.inputs_of("like") == {"var": (("measure", "var"),)}
 
 
 def test_the_toy_chain_recovers_the_variance_of_its_field():
     sigma = 2.0
     out = _run(resolve(TOY), {"sigma": sigma, "seed": 1})
     # The sample variance of n white-noise points has relative error sqrt(2/n).
-    n = len(out["sim"]["field"].values)
-    z = (out["measure"]["var"].value - sigma**2) / (sigma**2 * np.sqrt(2 / n))
+    n = len(out["sim", "field"].values)
+    z = (out["measure", "var"].value - sigma**2) / (sigma**2 * np.sqrt(2 / n))
     assert abs(z) < 5
 
 
@@ -210,12 +208,12 @@ def test_tags_pick_between_outputs_of_the_same_type():
         Measure(name="measure_b", tag="b"),
     ]
     graph = resolve(stages)
-    assert graph.inputs_of("measure_b") == {"field": ("sim_b", "field")}
+    assert graph.inputs_of("measure_b") == {"field": (("sim_b", "field"),)}
 
 
 def test_a_subclass_satisfies_a_requirement_for_its_base_type():
     graph = resolve([Simulator(output=LightconeField), Measure()])
-    assert graph.inputs_of("measure") == {"field": ("sim", "field")}
+    assert graph.inputs_of("measure") == {"field": (("sim", "field"),)}
 
 
 def _problems(stages, params=None):
@@ -474,3 +472,120 @@ def test_parameter_spaces_inside_the_domains_resolve(params):
 
 def test_the_check_hook_passes_a_consistent_space():
     resolve([Bubbles()], ParamSpace([Param("r_max", prior=(5.0, 30.0))]))
+
+
+FREQS = np.linspace(50.0, 100.0, 51)
+
+
+@attrs.frozen(eq=False)
+class Spectrum:
+    values: np.ndarray
+
+
+@attrs.frozen
+class PowerLaw:
+    """A power-law spectral component, with an amplitude parameter of its own."""
+
+    name: str
+    index: float = -2.5
+    tag: str = "model"
+
+    @property
+    def consumes(self):
+        return {f"{self.name}_amp": ParamSpec(REQUIRED)}
+
+    requires: ClassVar = {}
+
+    @property
+    def provides(self):
+        return {"spectrum": Slot(Spectrum, self.tag)}
+
+    def compute(self, params):
+        amp = params[f"{self.name}_amp"]
+        return {"spectrum": Spectrum(amp * (FREQS / 75.0) ** self.index)}
+
+
+@attrs.frozen
+class Residual:
+    """The data minus every model component, whichever stages provide them."""
+
+    data: np.ndarray = attrs.field(eq=False)
+    min_parts: int = 1
+    name: str = "residual"
+    consumes: ClassVar = {}
+    provides: ClassVar = {"residual": Slot(Spectrum, "residual")}
+
+    @property
+    def requires(self):
+        return {"parts": All(Spectrum, "model", min=self.min_parts)}
+
+    def compute(self, params, parts):
+        return {"residual": Spectrum(self.data - sum(p.values for p in parts))}
+
+
+@pytest.mark.parametrize("n_components", [1, 2, 3])
+def test_a_residual_subtracts_every_model_component_without_naming_them(
+    n_components,
+):
+    components = [PowerLaw(f"c{i}", index=-2.5 + 0.5 * i) for i in range(n_components)]
+    params = {f"c{i}_amp": 100.0 * (i + 1) for i in range(n_components)}
+    noise = np.random.default_rng(5).normal(0, 0.01, FREQS.size)
+    model = sum(params[f"{c.name}_amp"] * (FREQS / 75) ** c.index for c in components)
+
+    stages = [Residual(model + noise), *components]
+    graph = resolve(stages)
+    assert graph.inputs_of("residual") == {
+        "parts": tuple((c.name, "spectrum") for c in components)
+    }
+    out = _run(graph, params)
+    np.testing.assert_allclose(out["residual", "residual"].values, noise, atol=1e-10)
+
+
+def test_a_stage_does_not_collect_its_own_outputs():
+    @attrs.frozen
+    class Total:
+        """Sums the model components, and is itself a model component."""
+
+        name: str = "total"
+        consumes: ClassVar = {}
+        requires: ClassVar = {"parts": All(Spectrum, "model")}
+        provides: ClassVar = {"total": Slot(Spectrum, "model")}
+
+        def compute(self, params, parts):
+            return {"total": Spectrum(sum(p.values for p in parts))}
+
+    graph = resolve([Total(), PowerLaw("fg")])
+    assert graph.inputs_of("total") == {"parts": (("fg", "spectrum"),)}
+
+
+@pytest.mark.parametrize(
+    ("min_parts", "n_components", "expected"),
+    [
+        (
+            1,
+            0,
+            (
+                "Stage 'residual' requires every Spectrum['model'] (slot 'parts'), at "
+                "least 1, but no stage provides one."
+            ),
+        ),
+        (
+            3,
+            2,
+            (
+                "Stage 'residual' requires every Spectrum['model'] (slot 'parts'), at "
+                "least 3, but 2 stages provide one."
+            ),
+        ),
+    ],
+    ids=["none", "too_few"],
+)
+def test_too_few_matches_for_all_are_reported(min_parts, n_components, expected):
+    components = [PowerLaw(f"c{i}") for i in range(n_components)]
+    problems = _problems([Residual(FREQS, min_parts=min_parts), *components])
+    assert expected in problems
+
+
+def test_all_with_min_zero_accepts_no_matches():
+    out = _run(resolve([Residual(FREQS, min_parts=0)]), {})
+    np.testing.assert_array_equal(out["residual", "residual"].values, FREQS)
