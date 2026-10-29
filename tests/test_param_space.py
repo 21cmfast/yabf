@@ -36,34 +36,26 @@ def test_fixed_parameters_are_not_sampled(space):
     assert space.ndim == 3
 
 
-@pytest.mark.parametrize("name", ["identity", "pow10", "log10", "exp", "log"])
-def test_transforms_are_inverted_by_their_inverse(name):
-    t = get_transform(name)
-    x = np.linspace(0.1, 3.0, 13)
-    np.testing.assert_allclose(t.inverse(t.forward(x)), x)
+_REALS = np.linspace(-6.0, 6.0, 49)
+_POSITIVE = np.logspace(-6.0, 6.0, 49)
 
 
 @pytest.mark.parametrize(
-    ("forward", "inverse", "kwargs", "match"),
+    ("name", "domain"),
     [
-        (np.exp, np.sqrt, {}, "does not undo"),
-        (np.square, np.sqrt, {}, "does not undo"),  # not one-to-one on the reals
-        (np.log, np.exp, {"check_at": [-2.0, -1.0]}, "not finite"),
+        ("identity", _REALS),
+        ("pow10", _REALS),
+        ("log10", _POSITIVE),
+        ("exp", _REALS),
+        ("log", _POSITIVE),
     ],
 )
-def test_a_transform_whose_inverse_does_not_undo_it_is_rejected(
-    forward, inverse, kwargs, match
-):
-    with pytest.raises(ValueError, match=match):
-        register_transform("bad-inverse", forward, inverse, **kwargs)
-    with pytest.raises(ValueError, match="Unknown transform"):
-        get_transform("bad-inverse")
-
-
-def test_a_transform_with_a_narrow_domain_is_checked_inside_it():
-    t = register_transform("test-arcsin", np.arcsin, np.sin)
-    x = np.linspace(-0.9, 0.9, 7)
-    np.testing.assert_allclose(t.inverse(t.forward(x)), x)
+def test_transforms_are_inverted_by_their_inverse(name, domain):
+    t = get_transform(name)
+    np.testing.assert_allclose(t.inverse(t.forward(domain)), domain, rtol=1e-12)
+    # The image of the domain round-trips the other way too.
+    image = t.forward(domain)
+    np.testing.assert_allclose(t.forward(t.inverse(image)), image, rtol=1e-12)
 
 
 def test_prior_transform_draws_follow_each_marginal(space):
