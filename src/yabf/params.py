@@ -48,13 +48,39 @@ def register_transform(
     name: str,
     forward: Callable[[np.ndarray], np.ndarray],
     inverse: Callable[[np.ndarray], np.ndarray],
+    *,
+    check_at: Sequence[float] = (-2.0, -0.5, 0.1, 0.5, 1.0, 2.0, 5.0),
 ) -> Transform:
     """Register a transform under ``name``, so that a :class:`Param` can refer to it.
 
-    Both functions must be vectorised, and ``inverse`` must undo ``forward``.
+    Both functions must be vectorised, and ``inverse`` must undo ``forward``. This is
+    checked at the points ``check_at`` (in sampled values) before registering; points
+    where ``forward`` is not finite are skipped, so the defaults suit most transforms,
+    but a transform defined only on a narrow domain should pass points inside it.
+
+    Raises
+    ------
+    ValueError
+        If the name is taken, if ``forward`` is not finite at any of ``check_at``,
+        or if ``inverse`` does not undo ``forward``.
     """
     if name in _TRANSFORMS:
         raise ValueError(f"A transform named '{name}' is already registered.")
+    x = np.asarray(check_at, dtype=float)
+    with np.errstate(all="ignore"):
+        y = np.asarray(forward(x), dtype=float)
+        finite = np.isfinite(y)
+        if not finite.any():
+            raise ValueError(
+                f"Transform '{name}': forward is not finite at any of {x.tolist()}; "
+                "pass points inside its domain as check_at."
+            )
+        back = np.asarray(inverse(y[finite]), dtype=float)
+    if not np.allclose(back, x[finite], rtol=1e-8, atol=1e-10):
+        raise ValueError(
+            f"Transform '{name}': inverse does not undo forward; "
+            f"inverse(forward(x)) = {back.tolist()} at x = {x[finite].tolist()}."
+        )
     transform = Transform(name=name, forward=forward, inverse=inverse)
     _TRANSFORMS[name] = transform
     return transform
@@ -70,11 +96,13 @@ def get_transform(name: str) -> Transform:
         ) from None
 
 
-def _identity(x):
+def _identity(x: np.ndarray) -> np.ndarray:
+    """Return ``x`` unchanged."""
     return x
 
 
-def _pow10(x):
+def _pow10(x: np.ndarray) -> np.ndarray:
+    """Return ``10**x``; the inverse of :func:`numpy.log10`."""
     return 10.0**x
 
 
@@ -123,11 +151,15 @@ def get_relation(name: str) -> Relation:
         ) from None
 
 
-def _equal(x):
+def _equal(x: np.ndarray) -> np.ndarray:
+    """Return the single input unchanged: the tied parameter equals its input."""
     return x
 
 
-def _linear(*xs, coefficients, offset=0.0):
+def _linear(
+    *xs: np.ndarray, coefficients: Sequence[float], offset: float = 0.0
+) -> np.ndarray:
+    """Return ``offset + sum(c * x)`` over the inputs and their ``coefficients``."""
     return offset + sum(c * x for c, x in zip(coefficients, xs, strict=True))
 
 
