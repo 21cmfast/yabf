@@ -23,11 +23,12 @@ fiducial point for initialising walkers.
 from __future__ import annotations
 
 import graphlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import cached_property
 
 import attrs
 import numpy as np
+from numpy.typing import ArrayLike
 
 from .priors import JointPrior, Marginal, Prior, as_prior
 
@@ -142,7 +143,10 @@ register_relation("equal", _equal)
 register_relation("linear", _linear)
 
 
-def _frozen_kwargs(kwargs) -> tuple[tuple[str, object], ...]:
+def _frozen_kwargs(
+    kwargs: Mapping[str, object] | Iterable[tuple[str, object]],
+) -> tuple[tuple[str, object], ...]:
+    """Return keyword arguments as sorted ``(name, value)`` pairs, lists as tuples."""
     return tuple(
         (k, tuple(v) if isinstance(v, list) else v)
         for k, v in sorted(dict(kwargs).items())
@@ -178,7 +182,8 @@ class Tie:
     )
 
     @relation.validator
-    def _relation_validator(self, att, value):
+    def _relation_validator(self, att: attrs.Attribute, value: str) -> None:
+        """Check that ``relation`` names a registered relation."""
         get_relation(value)
 
     def __call__(self, values: Mapping[str, np.ndarray]) -> np.ndarray:
@@ -187,7 +192,7 @@ class Tie:
         return get_relation(self.relation).function(*args, **dict(self.kwargs))
 
 
-def as_tie(tie) -> Tie:
+def as_tie(tie: Tie | str | Mapping[str, float]) -> Tie:
     """Return ``tie`` as a :class:`Tie`.
 
     A string ``"x"`` ties the parameter to equal the model parameter ``x``. A mapping
@@ -205,15 +210,18 @@ def as_tie(tie) -> Tie:
     )
 
 
-def _check_transform(inst, att, value):
+def _check_transform(inst: Param, att: attrs.Attribute, value: str) -> None:
+    """Check that ``transform`` names a registered transform."""
     get_transform(value)
 
 
-def _optional_prior(value):
+def _optional_prior(value: Prior | tuple[float, float] | None) -> Prior | None:
+    """Convert ``value`` with :func:`~yabf.priors.as_prior`, keeping ``None``."""
     return None if value is None else as_prior(value)
 
 
-def _optional_tie(value):
+def _optional_tie(value: Tie | str | Mapping[str, float] | None) -> Tie | None:
+    """Convert ``value`` with :func:`as_tie`, keeping ``None``."""
     return None if value is None else as_tie(value)
 
 
@@ -271,7 +279,8 @@ class Param:
     latex: str = attrs.field(kw_only=True)
 
     @fiducial.default
-    def _fiducial_default(self):
+    def _fiducial_default(self) -> float:
+        """Default the fiducial value to the fixed value or the prior median."""
         if self.fixed is not None:
             return self.fixed
         if self.prior is None:
@@ -279,14 +288,16 @@ class Param:
         return self.prior.ppf(0.5)
 
     @feeds.default
-    def _feeds_default(self):
+    def _feeds_default(self) -> str:
+        """Default the fed model parameter to the parameter's own name."""
         return self.name
 
     @latex.default
-    def _latex_default(self):
+    def _latex_default(self) -> str:
+        """Default the LaTeX label to the parameter's name."""
         return self.name
 
-    def __attrs_post_init__(self):
+    def __attrs_post_init__(self) -> None:
         """Check that the parameter is fully and consistently specified."""
         given = [x is not None for x in (self.prior, self.fixed, self.tied)]
         if sum(given) != 1:
@@ -325,12 +336,13 @@ class Param:
         """Whether the parameter is sampled."""
         return self.prior is not None
 
-    def to_model(self, value):
+    def to_model(self, value: ArrayLike) -> np.ndarray:
         """Map a value in the sampled space to the value the model receives."""
         return get_transform(self.transform).forward(value)
 
 
-def _unique(kind: str, values: Sequence[str]):
+def _unique(kind: str, values: Sequence[str]) -> None:
+    """Raise if any of ``values`` (parameter ``kind``, for the message) repeats."""
     seen, dupes = set(), set()
     for v in values:
         (dupes if v in seen else seen).add(v)
@@ -338,7 +350,7 @@ def _unique(kind: str, values: Sequence[str]):
         raise ValueError(f"Duplicate parameter {kind}: {sorted(dupes)}.")
 
 
-def _check_feeds(params: Sequence[Param]):
+def _check_feeds(params: Sequence[Param]) -> None:
     """Check that each model parameter is fed once, or element by element."""
     by_feeds: dict[str, list[Param]] = {}
     for p in params:
@@ -421,7 +433,8 @@ class ParamSpace:
     params: tuple[Param, ...] = attrs.field(converter=tuple)
 
     @params.validator
-    def _params_validator(self, att, value):
+    def _params_validator(self, att: attrs.Attribute, value: tuple[Param, ...]) -> None:
+        """Check that the parameters form a consistent space."""
         for p in value:
             if not isinstance(p, Param):
                 raise TypeError(f"Expected Param instances, got {p!r}.")
@@ -432,10 +445,12 @@ class ParamSpace:
 
     @cached_property
     def _joint(self) -> list[tuple[JointPrior, list[int]]]:
+        """Each joint prior, with the columns of its parameters among the sampled."""
         return _joint_groups(self.sampled)
 
     @cached_property
     def _independent(self) -> list[int]:
+        """The columns of the sampled parameters that have a prior of their own."""
         return [
             i for i, p in enumerate(self.sampled) if not isinstance(p.prior, Marginal)
         ]
@@ -470,7 +485,8 @@ class ParamSpace:
         """The fiducial values of the sampled parameters."""
         return np.array([p.fiducial for p in self.sampled])
 
-    def _check_shape(self, x, what: str) -> np.ndarray:
+    def _check_shape(self, x: ArrayLike, what: str) -> np.ndarray:
+        """Return ``x`` as a float array, checking its last axis has length ``ndim``."""
         x = np.asarray(x, dtype=float)
         if x.shape[-1:] != (self.ndim,):
             raise ValueError(
@@ -478,7 +494,7 @@ class ParamSpace:
             )
         return x
 
-    def prior_transform(self, u) -> np.ndarray:
+    def prior_transform(self, u: ArrayLike) -> np.ndarray:
         """Map points of the unit hypercube to the sampled parameters."""
         u = self._check_shape(u, "u")
         out = np.empty(u.shape)
@@ -488,7 +504,7 @@ class ParamSpace:
             out[..., cols] = joint.transform(u[..., cols])
         return out
 
-    def log_prior(self, theta) -> np.ndarray | float:
+    def log_prior(self, theta: ArrayLike) -> np.ndarray:
         """The log prior density of the sampled parameters (``-inf`` outside it)."""
         theta = self._check_shape(theta, "theta")
         total = np.zeros(theta.shape[:-1])
@@ -498,7 +514,7 @@ class ParamSpace:
             total = total + joint.logpdf(theta[..., cols])
         return total
 
-    def to_model(self, theta) -> dict[str, np.ndarray]:
+    def to_model(self, theta: ArrayLike) -> dict[str, np.ndarray]:
         """Return the model parameters for ``theta``, keyed by the names they feed.
 
         Sampled values are transformed, fixed values are broadcast to the batch shape
@@ -508,7 +524,8 @@ class ParamSpace:
         theta = self._check_shape(theta, "theta")
         out, elements = {}, {}
 
-        def put(p, value):
+        def put(p: Param, value: np.ndarray) -> None:
+            """Store ``value`` as the model value, or vector element, ``p`` feeds."""
             if p.index is None:
                 out[p.feeds] = value
             else:
@@ -533,7 +550,7 @@ class ParamSpace:
         n: int,
         rng: np.random.Generator,
         scale: float = 0.01,
-        center=None,
+        center: ArrayLike | None = None,
         max_tries: int = 100,
     ) -> np.ndarray:
         """Draw ``n`` points from a Gaussian ball inside the prior, shape ``(n, ndim)``.
@@ -571,7 +588,7 @@ class ParamSpace:
         )
 
 
-def _element(value, i: int):
+def _element(value: object, i: int) -> object:
     """Return element ``i`` of a per-element sequence, or ``value`` if it is shared."""
     return value[i] if np.ndim(value) == 1 else value
 
@@ -580,9 +597,13 @@ def param_vector(
     name: str,
     length: int | None = None,
     *,
-    prior=None,
-    fixed=None,
-    fiducial=None,
+    prior: Prior
+    | tuple[float, float]
+    | JointPrior
+    | Sequence[Prior | tuple[float, float]]
+    | None = None,
+    fixed: Mapping[int, float] | Sequence[float] | None = None,
+    fiducial: float | Sequence[float] | None = None,
     feeds: str | None = None,
     transform: str = "identity",
     latex: str | None = None,
