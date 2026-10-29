@@ -19,6 +19,7 @@ from typing import Protocol, runtime_checkable
 
 import attrs
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy import linalg, stats
 
 
@@ -26,11 +27,11 @@ from scipy import linalg, stats
 class Prior(Protocol):
     """The interface a prior must provide."""
 
-    def logpdf(self, x):
+    def logpdf(self, x: ArrayLike) -> np.ndarray:
         """Return the log probability density at ``x``."""
         ...
 
-    def ppf(self, q):
+    def ppf(self, q: ArrayLike) -> np.ndarray:
         """Return the parameter value below which a fraction ``q`` of the prior lies."""
         ...
 
@@ -93,11 +94,11 @@ class JointPrior(Protocol):
         """The prior of each parameter on its own."""
         ...
 
-    def logpdf(self, x):
+    def logpdf(self, x: ArrayLike) -> np.ndarray:
         """Return the joint log probability density at ``x``, shape ``(..., dim)``."""
         ...
 
-    def transform(self, u):
+    def transform(self, u: ArrayLike) -> np.ndarray:
         """Map points of the unit hypercube, shape ``(..., dim)``, onto the prior."""
         ...
 
@@ -117,7 +118,7 @@ class MultivariateNormal:
         converter=lambda x: np.atleast_2d(np.asarray(x, float))
     )
 
-    def __attrs_post_init__(self):
+    def __attrs_post_init__(self) -> None:
         """Check that the covariance is a symmetric positive-definite matrix."""
         k = self.mean.size
         if self.mean.shape != (k,) or self.cov.shape != (k, k):
@@ -138,10 +139,12 @@ class MultivariateNormal:
 
     @cached_property
     def _cholesky(self) -> np.ndarray:
+        """The lower Cholesky factor ``L`` of the covariance, ``cov = L @ L.T``."""
         return linalg.cholesky(self.cov, lower=True)
 
     @cached_property
     def _precision(self) -> np.ndarray:
+        """The inverse of the covariance."""
         return linalg.cho_solve((self._cholesky, True), np.eye(self.dim))
 
     @property
@@ -157,19 +160,19 @@ class MultivariateNormal:
             for m, v in zip(self.mean, np.diag(self.cov), strict=True)
         )
 
-    def logpdf(self, x):
+    def logpdf(self, x: ArrayLike) -> np.ndarray:
         """Return the joint log probability density at ``x``, shape ``(..., dim)``."""
         d = np.asarray(x, dtype=float) - self.mean
         chi2 = np.einsum("...i,ij,...j->...", d, self._precision, d)
         logdet = 2 * np.sum(np.log(np.diag(self._cholesky)))
         return -0.5 * (chi2 + logdet + self.dim * np.log(2 * np.pi))
 
-    def transform(self, u):
+    def transform(self, u: ArrayLike) -> np.ndarray:
         """Map points of the unit hypercube, shape ``(..., dim)``, onto the prior."""
         return self.mean + stats.norm.ppf(u) @ self._cholesky.T
 
 
-def multivariate_normal(mean, cov) -> MultivariateNormal:
+def multivariate_normal(mean: ArrayLike, cov: ArrayLike) -> MultivariateNormal:
     """A multivariate normal prior with the given mean vector and covariance matrix."""
     return MultivariateNormal(mean, cov)
 
@@ -186,27 +189,28 @@ class Marginal:
     index: int = attrs.field(validator=attrs.validators.ge(0))
 
     @index.validator
-    def _index_validator(self, att, value):
+    def _index_validator(self, att: attrs.Attribute, value: int) -> None:
+        """Check that ``index`` names one of the joint prior's parameters."""
         if value >= self.joint.dim:
             raise ValueError(
                 f"A joint prior over {self.joint.dim} parameters has no parameter "
                 f"{value}."
             )
 
-    def logpdf(self, x):
+    def logpdf(self, x: ArrayLike) -> np.ndarray:
         """Return the marginal log probability density at ``x``."""
         return self.joint.marginals[self.index].logpdf(x)
 
-    def ppf(self, q):
+    def ppf(self, q: ArrayLike) -> np.ndarray:
         """Return the value below which a fraction ``q`` of the marginal lies."""
         return self.joint.marginals[self.index].ppf(q)
 
-    def cdf(self, x):
+    def cdf(self, x: ArrayLike) -> np.ndarray:
         """Return the fraction of the marginal below ``x``."""
         return self.joint.marginals[self.index].cdf(x)
 
 
-def as_prior(prior) -> Prior:
+def as_prior(prior: Prior | tuple[float, float]) -> Prior:
     """Return ``prior`` as a :class:`Prior`.
 
     A ``(low, high)`` tuple becomes a uniform prior. Any object that already has
