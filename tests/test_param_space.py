@@ -43,6 +43,29 @@ def test_transforms_are_inverted_by_their_inverse(name):
     np.testing.assert_allclose(t.inverse(t.forward(x)), x)
 
 
+@pytest.mark.parametrize(
+    ("forward", "inverse", "kwargs", "match"),
+    [
+        (np.exp, np.sqrt, {}, "does not undo"),
+        (np.square, np.sqrt, {}, "does not undo"),  # not one-to-one on the reals
+        (np.log, np.exp, {"check_at": [-2.0, -1.0]}, "not finite"),
+    ],
+)
+def test_a_transform_whose_inverse_does_not_undo_it_is_rejected(
+    forward, inverse, kwargs, match
+):
+    with pytest.raises(ValueError, match=match):
+        register_transform("bad-inverse", forward, inverse, **kwargs)
+    with pytest.raises(ValueError, match="Unknown transform"):
+        get_transform("bad-inverse")
+
+
+def test_a_transform_with_a_narrow_domain_is_checked_inside_it():
+    t = register_transform("test-arcsin", np.arcsin, np.sin)
+    x = np.linspace(-0.9, 0.9, 7)
+    np.testing.assert_allclose(t.inverse(t.forward(x)), x)
+
+
 def test_prior_transform_draws_follow_each_marginal(space):
     rng = np.random.default_rng(0)
     theta = space.sample_prior(4000, rng)
