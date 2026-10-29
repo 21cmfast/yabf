@@ -31,6 +31,9 @@ the checks to run before pushing (`ruff` and `pytest`).
 - **Look for an existing implementation before writing your own**, here and in our
   dependencies. When scoping a change, ask whether refactoring existing code would
   make it simpler.
+- **Give every function and method type hints and a docstring**, private helpers
+  included. One line is enough for a simple one. Small built-ins are what people
+  copy when writing their own, so they set the standard.
 - **Prefer immutable objects with clear transformations**, built with `attrs`
   (frozen classes; `evolve`/methods that return new objects rather than mutating).
 - **Prefer composition over inheritance**, unless inheritance is exactly right for
