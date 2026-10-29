@@ -16,7 +16,8 @@ object with these attributes is a stage:
         requires = {"field": Field}
         provides = {"smoothed": Slot(Field, tag="smoothed")}
 
-        def compute(self, params, field):
+        def compute(self, params: Mapping, field: Field) -> dict[str, Field]:
+            """Smooth the field on the scale ``width``."""
             return {"smoothed": field.smoothed(params["width"])}
 
 Inputs and outputs are matched by :class:`Slot`, a type and a tag, never by the name
@@ -29,17 +30,21 @@ reports every problem it finds before anything is computed.
 from __future__ import annotations
 
 import graphlib
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 import attrs
 import numpy as np
+from numpy.typing import ArrayLike
 
-from .params import ParamSpace
+from .params import Param, ParamSpace
 
 
 class _Required:
+    """The type of :data:`REQUIRED`."""
+
     def __repr__(self) -> str:
+        """Show the sentinel by name."""
         return "REQUIRED"
 
 
@@ -47,7 +52,8 @@ REQUIRED = _Required()
 """The default of a parameter that a stage cannot compute without."""
 
 
-def _domain(value):
+def _domain(value: Iterable[float] | None) -> tuple[float, float] | None:
+    """Return a domain as a ``(low, high)`` pair of floats, checking low <= high."""
     if value is None:
         return None
     low, high = (float(v) for v in value)
@@ -56,7 +62,8 @@ def _domain(value):
     return (low, high)
 
 
-def _fmt(value) -> str:
+def _fmt(value: ArrayLike) -> str:
+    """Format a scalar or array value briefly, for error messages."""
     if np.ndim(value) == 0:
         return f"{float(value):g}"
     return np.array2string(np.asarray(value), precision=4)
@@ -91,7 +98,7 @@ class ParamSpec:
     shape: tuple[int, ...] = attrs.field(default=(), converter=tuple)
     description: str = ""
 
-    def __attrs_post_init__(self):
+    def __attrs_post_init__(self) -> None:
         """Check that the default is a value the stage accepts."""
         if not self.required and (why := self.why_not(self.default)):
             raise ValueError(f"The default {_fmt(self.default)} {why}.")
@@ -101,13 +108,14 @@ class ParamSpec:
         """Whether the stage cannot compute without a value for the parameter."""
         return self.default is REQUIRED
 
-    def why_not(self, value) -> str | None:
+    def why_not(self, value: ArrayLike) -> str | None:
         """Say why the stage does not accept ``value``, or return None if it does."""
         if np.shape(value) != self.shape:
             return f"has shape {np.shape(value)}, not {self.shape}"
         return self._outside_domain(value)
 
-    def _outside_domain(self, value) -> str | None:
+    def _outside_domain(self, value: ArrayLike) -> str | None:
+        """Say how ``value`` falls outside the domain, or return None if it doesn't."""
         if self.domain is not None:
             low, high = self.domain
             v = np.asarray(value, dtype=float)
@@ -138,7 +146,7 @@ class Slot:
         return f"{name}[{self.tag!r}]" if self.tag else name
 
 
-def as_slot(slot) -> Slot:
+def as_slot(slot: Slot | type) -> Slot:
     """Return ``slot`` as a :class:`Slot`; a bare type has the empty tag."""
     if isinstance(slot, Slot):
         return slot
@@ -180,7 +188,8 @@ class All:
         return f"every {self.slot}"
 
 
-def _as_requirement(req) -> Slot | All:
+def _as_requirement(req: Slot | All | type) -> Slot | All:
+    """Return a requirement as an :class:`All` or a :class:`Slot`."""
     return req if isinstance(req, All) else as_slot(req)
 
 
@@ -210,16 +219,18 @@ class Stage(Protocol):
     requires: Mapping[str, Slot | All | type]
     provides: Mapping[str, Slot | type]
 
-    def compute(self, params: Mapping[str, Any], **inputs) -> dict[str, Any]:
+    def compute(self, params: Mapping[str, Any], **inputs: object) -> dict[str, Any]:
         """Compute the provided slots from parameters and required inputs."""
         ...
 
 
-def _requires(stage) -> dict[str, Slot | All]:
+def _requires(stage: Stage) -> dict[str, Slot | All]:
+    """The requirements of ``stage``, with bare types made into slots."""
     return {k: _as_requirement(v) for k, v in stage.requires.items()}
 
 
-def _provides(stage) -> dict[str, Slot]:
+def _provides(stage: Stage) -> dict[str, Slot]:
+    """The outputs of ``stage``, with bare types made into slots."""
     return {k: as_slot(v) for k, v in stage.provides.items()}
 
 
@@ -236,7 +247,8 @@ class Link:
 class GraphError(ValueError):
     """A stage graph that cannot be resolved; ``problems`` lists every reason."""
 
-    def __init__(self, problems: list[str]):
+    def __init__(self, problems: list[str]) -> None:
+        """Collect ``problems`` into one message, one per line."""
         self.problems = problems
         super().__init__(
             "The stage graph is invalid:\n" + "\n".join(f"- {p}" for p in problems)
@@ -288,14 +300,16 @@ class StageGraph:
         }
 
     def _stage(self, name: str) -> Stage:
+        """Return the stage called ``name``."""
         return next(s for s in self.stages if s.name == name)
 
 
-def _describe_param(p) -> str:
+def _describe_param(p: Param) -> str:
+    """Name a parameter, and the model parameter it feeds if that differs."""
     return repr(p.name) if p.name == p.feeds else f"{p.name!r} (feeds {p.feeds!r})"
 
 
-def _unused_params(stages, params: ParamSpace) -> list[str]:
+def _unused_params(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
     """Return the parameters that reach no stage, directly or through a tie."""
     consumed = set().union(*(s.consumes for s in stages))
     by_feeds = {p.feeds: p for p in params.params}
@@ -312,7 +326,7 @@ def _unused_params(stages, params: ParamSpace) -> list[str]:
     return [_describe_param(p) for p in params.params if p.feeds not in used]
 
 
-def _probes(params: ParamSpace):
+def _probes(params: ParamSpace) -> Iterator[tuple[str, np.ndarray]]:
     """Yield points of the parameter space to check the stages at, with a label.
 
     The points are the fiducial point, each sampled parameter near both edges of its
@@ -329,7 +343,7 @@ def _probes(params: ParamSpace):
         yield "at a prior draw", theta
 
 
-def _param_problems(stages, params: ParamSpace) -> list[str]:
+def _param_problems(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
     """Check the parameter space against what each stage accepts, computing nothing."""
     found: dict[tuple[str, str], str] = {}  # the first problem per stage and parameter
     by_feeds: dict[str, list] = {}  # several parameters feed a vector's elements
@@ -384,7 +398,7 @@ def _param_problems(stages, params: ParamSpace) -> list[str]:
     return list(found.values())
 
 
-def _link(stages) -> tuple[list[Link], list[str]]:
+def _link(stages: Sequence[Stage]) -> tuple[list[Link], list[str]]:
     """Link every required slot to its provider, and describe the ones that fail."""
     provided = [(s.name, k, slot) for s in stages for k, slot in _provides(s).items()]
     links, problems = [], []
