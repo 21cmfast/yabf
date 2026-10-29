@@ -17,7 +17,7 @@ object with these attributes is a stage:
         provides = {"smoothed": Slot(Field, tag="smoothed")}
 
         def compute(self, params: Mapping, field: Field) -> dict[str, Field]:
-            """Smooth the field on the scale ``width``."""
+            '''Smooth the field on the scale ``width``.'''
             return {"smoothed": field.smoothed(params["width"])}
 
 Inputs and outputs are matched by :class:`Slot`, a type and a tag, never by the name
