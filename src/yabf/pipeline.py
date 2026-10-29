@@ -21,7 +21,7 @@ outputs such as observables; a simulator's products are never cached.
 from __future__ import annotations
 
 from collections import Counter, OrderedDict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from typing import Any
 
 import attrs
@@ -33,7 +33,7 @@ from .stages import Stage, StageGraph, call_stage, resolve
 Output = tuple[str, str]
 
 
-def _freeze(value):
+def _freeze(value: object) -> Hashable:
     """Return a hashable stand-in for a parameter value, for use in cache keys."""
     if isinstance(value, np.ndarray):
         return (value.dtype.str, value.shape, value.tobytes())
@@ -108,6 +108,7 @@ class Pipeline:
         keys: dict[str, tuple] = {}
 
         def key(name: str) -> tuple:
+            """Stage ``name``'s cache key: its consumed values and its inputs' keys."""
             if name not in keys:
                 consumed = sorted(
                     (k, _freeze(v))
@@ -126,6 +127,7 @@ class Pipeline:
         run, hits = set(), {}
 
         def need(name: str) -> None:
+            """Mark stage ``name``, and what it needs, to run unless it is cached."""
             if name in run or name in hits:
                 return
             cached = (
@@ -161,9 +163,18 @@ class Pipeline:
         return {w: store[w] for w in want}
 
     def _cacheable(self, stage: Stage) -> bool:
+        """Whether results of ``stage`` are kept across evaluations."""
         return self.cache_size > 0 and getattr(stage, "cacheable", False)
 
-    def _run(self, stage, params, store, remaining, wanted, key) -> None:
+    def _run(
+        self,
+        stage: Stage,
+        params: Mapping[str, Any],
+        store: dict[Output, object],
+        remaining: Counter[Output],
+        wanted: set[Output],
+        key: Callable[[str], tuple],
+    ) -> None:
         """Compute one stage, then release the inputs that nothing else needs."""
         out = call_stage(stage, params, self.graph.gather(stage.name, store))
         if self._cacheable(stage):
@@ -179,7 +190,8 @@ class Pipeline:
                 if not remaining[src] and src not in wanted:
                     del store[src]
 
-    def _check_want(self, want) -> tuple[Output, ...]:
+    def _check_want(self, want: Iterable[Output] | None) -> tuple[Output, ...]:
+        """Return the requested outputs as a tuple, checking the pipeline has them."""
         if want is None:
             return self.final_outputs
         want = tuple(tuple(w) for w in want)
