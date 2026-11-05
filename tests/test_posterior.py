@@ -208,7 +208,7 @@ def test_log_likelihood_terms_add_up():
 
     lnl, _ = post.log_likelihood(theta)
 
-    assert post.likelihoods == (("like", "lnl"), ("like2", "lnl"))
+    assert post.loglike_outputs == (("like", "lnl"), ("like2", "lnl"))
     np.testing.assert_allclose(
         lnl, closed_form(theta, DATA)[0] + closed_form(theta, other)[0], rtol=1e-12
     )
