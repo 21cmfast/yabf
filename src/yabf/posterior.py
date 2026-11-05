@@ -36,7 +36,7 @@ from numpy.typing import ArrayLike
 from .likelihoods import Likelihood, ParametrisedLikelihood
 from .params import DerivedParam, Param, ParamSpace
 from .pipeline import Output, Pipeline
-from .stages import One, ParamSpec, Stage, call_stage
+from .stages import All, One, ParamSpec, Stage, call_stage
 
 
 class LogLikelihood(float):
@@ -69,12 +69,22 @@ def _as_model(model: One | type) -> One:
 
 
 def _forward_stage(inst: LikelihoodTerm, att: attrs.Attribute, value: tuple) -> None:
-    """Check that each forward stage maps one input to one output."""
+    """Check that each forward stage maps the term's model to a model of its type."""
+    model = inst.model.type
     for stage in value:
-        if len(stage.requires) != 1 or len(stage.provides) != 1:
+        need, give = [*stage.requires.values()], [*stage.provides.values()]
+        if len(need) != 1 or len(give) != 1 or isinstance(need[0], All):
             raise ValueError(
                 f"Forward stage {stage.name!r} of {inst.name!r} must take one input "
                 "and provide one output, the model before and after it."
+            )
+        need = need[0] if isinstance(need[0], type) else need[0].type
+        give = give[0]
+        if not (issubclass(model, need) and issubclass(give, model)):
+            raise TypeError(
+                f"Forward stage {stage.name!r} of {inst.name!r} maps a "
+                f"{need.__qualname__} to a {give.__qualname__}, but the model it "
+                f"forwards is a {model.__qualname__}."
             )
 
 
@@ -105,8 +115,9 @@ class LikelihoodTerm:
         ``"model"``, or a :class:`~yabf.stages.One`, such as ``One(Spectrum,
         name="sky")``.
     forward
-        Stages applied to the model before scoring, each taking one input and
-        providing one output of the same type.
+        Stages applied to the model before scoring, each taking one input that
+        accepts the model's type and providing one output of that type (or a
+        subclass).
     """
 
     name: str
@@ -173,7 +184,7 @@ class LikelihoodTerm:
         """Run the checks of the forward stages that define one."""
         for stage in self.forward:
             if hasattr(stage, "check"):
-                stage.check({k: params[k] for k in stage.parameters if k in params})
+                stage.check({k: params[k] for k in stage.parameters})
 
     def parameter_values(self, params: Mapping[str, object]) -> dict[str, object]:
         """Return the values of the term's parameters: from ``params``, or defaults."""

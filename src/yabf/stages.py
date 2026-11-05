@@ -107,7 +107,9 @@ class ParamSpec:
     domain: tuple[float, float] | None = attrs.field(default=None, converter=_domain)
     shape: tuple[int, ...] = attrs.field(default=(), converter=tuple)
     description: str = ""
-    random: bool = attrs.field(default=False, kw_only=True)
+    random: bool = attrs.field(
+        default=False, validator=attrs.validators.instance_of(bool), kw_only=True
+    )
 
     def __attrs_post_init__(self) -> None:
         """Check that the default is a value the stage accepts."""

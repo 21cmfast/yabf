@@ -11,7 +11,7 @@ from yabf import priors
 from yabf.likelihoods import Gaussian
 from yabf.params import Param, param_vector
 from yabf.posterior import LikelihoodTerm, Posterior
-from yabf.stages import REQUIRED, GraphError, ParamSpec
+from yabf.stages import REQUIRED, All, GraphError, ParamSpec
 
 X = np.linspace(-1.0, 1.0, 6)
 COV = np.diag(np.full(X.size, 0.3**2)) + 0.01
@@ -52,8 +52,8 @@ class Gain:
 
     name: str = "gain"
     domain: tuple = (0, np.inf)
-    requires: ClassVar = {"model": Curve}
-    provides: ClassVar = {"model": Curve}
+    requires: dict = attrs.field(factory=lambda: {"model": Curve})
+    provides: dict = attrs.field(factory=lambda: {"model": Curve})
 
     @property
     def parameters(self):
@@ -150,10 +150,43 @@ def test_a_likelihood_with_its_own_parameters_gets_them_from_the_posterior():
         np.testing.assert_allclose(
             lnl, mvn(0.1 + 0.7 * X, cov=noise**2 * COV), rtol=1e-12
         )
-    # Its parameter is checked against its domain like any stage's.
-    with pytest.raises(GraphError, match="outside"):
+
+
+@attrs.frozen(eq=False)
+class Clip:
+    """An instrument stage clipping the model to a band ``[low, high]``."""
+
+    name: str = "clip"
+    parameters: ClassVar = {"low": ParamSpec(-1.0), "high": ParamSpec(1.0)}
+    requires: ClassVar = {"model": Curve}
+    provides: ClassVar = {"model": Curve}
+
+    def check(self, params):
+        if params["low"] >= params["high"]:
+            raise ValueError("the band must have low < high.")
+
+    def compute(self, params, model):
+        return {"model": Curve(np.clip(model.values, params["low"], params["high"]))}
+
+
+@pytest.mark.parametrize(
+    ("term", "param", "match"),
+    [
+        (LikelihoodTerm("lk", ScaledGaussian(COV), DATA, Curve), "noise", "outside"),
+        (
+            LikelihoodTerm("lk", Gaussian(COV), DATA, Curve, forward=[Clip()]),
+            "low",
+            "low < high",
+        ),
+    ],
+    ids=["likelihood_domain", "forward_check"],
+)
+def test_term_parameters_are_checked_against_the_prior(term, param, match):
+    """A term's parameters, from its likelihood or its forward stages, are checked
+    like any stage's: here, a prior reaching values the term rejects."""
+    with pytest.raises(GraphError, match=match):
         Posterior(
-            [*BETA, Param("noise", prior=(-1.0, 1.0))], [Line()], likelihoods=[term]
+            [*BETA, Param(param, prior=(-2.0, 2.0))], [Line()], likelihoods=[term]
         )
 
 
@@ -218,29 +251,19 @@ class TwoInputs:
 
 
 @pytest.mark.parametrize(
-    ("make", "match"),
+    ("forward", "error", "match"),
     [
-        (
-            lambda: LikelihoodTerm(
-                "lk", Gaussian(COV), DATA, Curve, forward=[TwoInputs()]
-            ),
-            "take one input",
-        ),
-        (
-            lambda: LikelihoodTerm(
-                "lk",
-                Gaussian(COV),
-                DATA,
-                Curve,
-                forward=[Gain(), Gain(name="g2", domain=(1, 2))],
-            ),
-            "twice",
-        ),
+        ([TwoInputs()], ValueError, "take one input"),
+        ([Gain(), Gain(name="g2", domain=(1, 2))], ValueError, "twice"),
+        ([Gain(requires={"model": All(Curve)})], ValueError, "take one input"),
+        ([Gain(requires={"model": float})], TypeError, "maps a float"),
+        ([Gain(provides={"model": float})], TypeError, "to a float"),
     ],
+    ids=["two_inputs", "conflicting_specs", "all_input", "wrong_input", "wrong_output"],
 )
-def test_malformed_terms_are_rejected(make, match):
-    with pytest.raises(ValueError, match=match):
-        make()
+def test_malformed_terms_are_rejected(forward, error, match):
+    with pytest.raises(error, match=match):
+        LikelihoodTerm("lk", Gaussian(COV), DATA, Curve, forward=forward)
 
 
 def test_mocks_are_drawn_one_point_at_a_time():
