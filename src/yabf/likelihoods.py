@@ -19,12 +19,16 @@ which is the likelihood of the other channels with the flagged one marginalised.
 
 from __future__ import annotations
 
-from typing import Literal, Protocol, runtime_checkable
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import attrs
 import numpy as np
 from numpy.typing import ArrayLike
 from scipy import linalg, special, stats
+
+if TYPE_CHECKING:
+    from .stages import ParamSpec
 
 
 @runtime_checkable
@@ -37,6 +41,22 @@ class Likelihood(Protocol):
 
     def simulate(self, model: object, rng: np.random.Generator) -> np.ndarray:
         """Draw data from the distribution that :meth:`loglike` scores."""
+        ...
+
+
+@runtime_checkable
+class ParametrisedLikelihood(Likelihood, Protocol):
+    """A likelihood whose noise model has parameters of its own, to be sampled.
+
+    ``parameters`` maps each parameter's name to a :class:`~yabf.stages.ParamSpec`, as
+    for a stage, and ``with_params`` returns the likelihood at given values of them.
+    A :class:`~yabf.posterior.LikelihoodTerm` routes the parameters to it.
+    """
+
+    parameters: Mapping[str, ParamSpec]
+
+    def with_params(self, params: Mapping[str, object]) -> Likelihood:
+        """Return the likelihood at the parameter values ``params``."""
         ...
 
 
