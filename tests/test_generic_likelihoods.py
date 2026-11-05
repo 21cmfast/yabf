@@ -29,6 +29,7 @@ class Model:
 
 
 def random_covariance(n, rng, scale=1.0):
+    """Return a random symmetric positive-definite n x n matrix."""
     a = rng.standard_normal((n, n))
     return scale * (a @ a.T / n + np.eye(n))
 
@@ -120,6 +121,7 @@ def test_each_likelihood_is_a_normalised_density_of_the_data(name):
     lik = DENSITIES_1D[name]
 
     def density(d):
+        """Return the likelihood's density of the data value ``d``."""
         return np.exp(lik.loglike([0.3], [d]))
 
     total = sum(
@@ -228,3 +230,61 @@ def test_a_bounded_upper_limit_stays_finite_far_from_the_model():
     upper, lower = stats.norm.logsf(38.0), stats.norm.logsf(40.0)
     expected = upper + np.log1p(-np.exp(lower - upper)) - np.log(2.0)
     np.testing.assert_allclose(lnl, expected, rtol=1e-8)
+
+
+KEEP = np.array([True, False, True, True])
+
+
+@pytest.mark.parametrize(
+    ("lik", "reduced", "model", "data"),
+    [
+        (Gaussian(C_DATA), Gaussian(C_DATA[np.ix_(KEEP, KEEP)]), M4, D4),
+        (
+            MultivariateT(C_DATA, df=4),
+            MultivariateT(C_DATA[np.ix_(KEEP, KEEP)], df=4),
+            M4,
+            D4,
+        ),
+        (Poisson(), Poisson(), [2.5, 1.0, 0.3, 7.0], [3, 0, 0, 5]),
+        (UpperLimit(0.5), UpperLimit(0.5), M4, D4),
+        (UpperLimit(0.5, 3.0), UpperLimit(0.5, 3.0), M4, D4),
+        (AsymmetricGaussian(0.4, 1.3), AsymmetricGaussian(0.4, 1.3), M4, D4),
+        (TabulatedPDF(X, TABLE), TabulatedPDF(X, TABLE), M4, D4),
+    ],
+)
+def test_a_flagged_channel_is_marginalised_out(lik, reduced, model, data):
+    """A NaN data value is left out: the likelihood is that of the other channels,
+    with the flagged one marginalised (for a Gaussian, the sub-covariance)."""
+    flagged = np.array(data, dtype=float)
+    flagged[~KEEP] = np.nan
+    expected = reduced.loglike(np.asarray(model)[KEEP], np.asarray(data)[KEEP])
+    np.testing.assert_allclose(lik.loglike(model, flagged), expected, rtol=1e-12)
+
+
+def test_a_likelihood_cannot_be_changed_after_construction():
+    cov = C_DATA.copy()
+    lik = Gaussian(cov)
+    before = lik.loglike(M4, D4)
+    cov[0, 0] = 100.0  # the caller's array is not shared
+    with pytest.raises(ValueError, match="read-only"):
+        lik.covariance[0, 0] = 100.0
+    with pytest.raises(ValueError, match="read-only"):
+        lik.total_covariance(M4)[0, 0] = 100.0
+    assert lik.loglike(M4, D4) == before
+
+
+class ExplodingCovariance:
+    """A model whose covariance cannot be computed."""
+
+    values = M4
+
+    @property
+    def covariance(self):
+        """Raise, as a model covariance that is unavailable would."""
+        raise RuntimeError("no model covariance")
+
+
+def test_an_ignored_model_covariance_is_never_read():
+    lik = Gaussian(C_DATA, model_covariance="ignore")
+    expected = Gaussian(C_DATA).loglike(M4, D4)
+    np.testing.assert_allclose(lik.loglike(ExplodingCovariance(), D4), expected)
