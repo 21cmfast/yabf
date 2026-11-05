@@ -12,6 +12,9 @@ noise. ``model`` and ``data`` are arrays of values, in the same units, or object
 ``values`` attribute (such as an observable). A model may also carry a ``covariance``
 attribute, its own uncertainty, which :class:`Gaussian` can add to the data
 covariance.
+
+A data value that is NaN marks a flagged channel: it is left out of the likelihood,
+which is the likelihood of the other channels with the flagged one marginalised.
 """
 
 from __future__ import annotations
@@ -48,9 +51,21 @@ def _model_covariance(model: object) -> np.ndarray | None:
     return None if cov is None else np.asarray(cov, dtype=float)
 
 
+def _frozen(x: np.ndarray) -> np.ndarray:
+    """Return a read-only copy of ``x``."""
+    x = np.array(x, dtype=float)
+    x.setflags(write=False)
+    return x
+
+
 def _matrix(x: ArrayLike) -> np.ndarray:
-    """Return ``x`` as a 2D float array."""
-    return np.atleast_2d(np.asarray(x, dtype=float))
+    """Return ``x`` as a read-only 2D float array."""
+    return _frozen(np.atleast_2d(np.asarray(x, dtype=float)))
+
+
+def _observed(data: np.ndarray) -> np.ndarray:
+    """Return which data values are observed: those that are not flagged as NaN."""
+    return ~np.isnan(data)
 
 
 def _positive(x: ArrayLike) -> np.ndarray:
@@ -58,7 +73,7 @@ def _positive(x: ArrayLike) -> np.ndarray:
     x = np.atleast_1d(np.asarray(x, dtype=float))
     if not np.all(x > 0):
         raise ValueError(f"Standard deviations must be positive, got {x}.")
-    return x
+    return _frozen(x)
 
 
 def _check_covariance(inst: object, att: attrs.Attribute, cov: np.ndarray) -> None:
@@ -109,18 +124,20 @@ class Gaussian:
 
     def total_covariance(self, model: object) -> np.ndarray:
         """Return the covariance of the data given ``model``."""
-        cov = _model_covariance(model)
-        if cov is None or self.model_covariance == "ignore":
+        if self.model_covariance == "ignore":
             return self.covariance
-        return self.covariance + cov
+        cov = _model_covariance(model)
+        return self.covariance if cov is None else self.covariance + cov
 
     def loglike(self, model: object, data: object) -> float:
         """Return the log probability density of ``data`` given ``model``."""
         m, d = _values(model), _values(data)
         _check_size(len(self.covariance), m)
         _check_size(len(self.covariance), d, "data")
-        chol = linalg.cho_factor(self.total_covariance(model), lower=True)
-        r = d - m
+        keep = _observed(d)
+        cov = self.total_covariance(model)[np.ix_(keep, keep)]
+        chol = linalg.cho_factor(cov, lower=True)
+        r = (d - m)[keep]
         chi2 = r @ linalg.cho_solve(chol, r)
         logdet = 2 * np.sum(np.log(np.diag(chol[0])))
         return float(-0.5 * (chi2 + logdet + r.size * np.log(2 * np.pi)))
@@ -157,9 +174,10 @@ class MultivariateT:
         m, d = _values(model), _values(data)
         _check_size(len(self.shape), m)
         _check_size(len(self.shape), d, "data")
-        return float(
-            stats.multivariate_t(loc=m, shape=self.shape, df=self.df).logpdf(d)
-        )
+        keep = _observed(d)
+        shape = self.shape[np.ix_(keep, keep)]
+        dist = stats.multivariate_t(loc=m[keep], shape=shape, df=self.df)
+        return float(dist.logpdf(d[keep]))
 
     def simulate(self, model: object, rng: np.random.Generator) -> np.ndarray:
         """Draw data from the t distribution about ``model``."""
@@ -177,6 +195,8 @@ class Poisson:
         """Return the log probability of counts ``data`` given means ``model``."""
         mu, k = _values(model), _values(data)
         _check_size(mu.size, k, "data")
+        keep = _observed(k)
+        mu, k = mu[keep], k[keep]
         if np.any(k < 0) or np.any(k != np.round(k)):
             raise ValueError("Poisson data must be non-negative whole numbers.")
         return float(np.sum(stats.poisson.logpmf(k, mu)))
@@ -218,9 +238,10 @@ class UpperLimit:
     def loglike(self, model: object, data: object) -> float:
         """Return the log-likelihood of ``model`` given the measurements ``data``."""
         m, d = _values(model), _values(data)
-        sigma = np.broadcast_to(self.sigma, m.shape)
         _check_size(m.size, d, "data")
-        a = (d - m) / sigma
+        keep = _observed(d)
+        sigma = np.broadcast_to(self.sigma, m.shape)[keep]
+        a = (d - m)[keep] / sigma
         if self.systematic_bound is None:
             return float(np.sum(special.log_ndtr(a)))
         b = a - self.systematic_bound / sigma
@@ -261,8 +282,10 @@ class AsymmetricGaussian:
         """Return the log probability density of ``data`` given ``model``."""
         m, d = _values(model), _values(data)
         _check_size(m.size, d, "data")
-        lo = np.broadcast_to(self.sigma_lower, m.shape)
-        hi = np.broadcast_to(self.sigma_upper, m.shape)
+        keep = _observed(d)
+        m, d = m[keep], d[keep]
+        lo = np.broadcast_to(self.sigma_lower, keep.shape)[keep]
+        hi = np.broadcast_to(self.sigma_upper, keep.shape)[keep]
         sigma = np.where(d < m, lo, hi)
         norm = np.log(np.sqrt(np.pi / 2) * (lo + hi))
         return float(np.sum(-0.5 * ((d - m) / sigma) ** 2 - norm))
@@ -292,7 +315,7 @@ def _grid(x: ArrayLike) -> np.ndarray:
     x = np.asarray(x, dtype=float).ravel()
     if x.size < 2 or np.any(np.diff(x) <= 0):
         raise ValueError("A tabulated grid must have at least two increasing points.")
-    return x
+    return _frozen(x)
 
 
 @attrs.frozen(eq=False)
@@ -307,7 +330,7 @@ class TabulatedPDF:
 
     x: np.ndarray = attrs.field(converter=_grid)
     pdf: np.ndarray = attrs.field(
-        converter=lambda p: np.asarray(p, dtype=float).ravel(), validator=_tabulated_pdf
+        converter=lambda p: _frozen(np.ravel(p)), validator=_tabulated_pdf
     )
 
     @property
@@ -319,7 +342,9 @@ class TabulatedPDF:
         """Return the log probability density of ``data`` given ``model``."""
         m, d = _values(model), _values(data)
         _check_size(m.size, d, "data")
-        density = np.interp(d - m, self.x, self._density, left=0.0, right=0.0)
+        keep = _observed(d)
+        r = (d - m)[keep]
+        density = np.interp(r, self.x, self._density, left=0.0, right=0.0)
         with np.errstate(divide="ignore"):
             return float(np.sum(np.log(density)))
 
