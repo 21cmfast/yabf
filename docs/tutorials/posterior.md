@@ -140,12 +140,12 @@ SIGMA = 0.05  # K
 radiometer = Gaussian.from_sigma(np.full(NU.size, SIGMA))
 ```
 
-Next, we need to say which model output the likelihood should score, and against
-which data. A {class}`~yabf.posterior.LikelihoodTerm` does this: it is a stage that
-takes one model output, here the `Spectrum` named `"sky"`, and scores the data against
-it with the likelihood. Together with the parameters and the stages, the terms make a
-posterior. Since we will build several posteriors below, we write a small function
-that makes one from a measured spectrum:
+Next, we need to say which model output the likelihood should score. A
+{class}`~yabf.posterior.LikelihoodTerm` does this: it is a stage that takes one model
+output, here the `Spectrum` named `"sky"`, and scores data against it with the
+likelihood. Together with the parameters and the stages, the terms make a posterior.
+We also ask the posterior to return the signal as a *derived* output, which we will
+use below:
 
 ```{code-cell} python
 params = [
@@ -157,26 +157,30 @@ params = [
 ]
 stages = [Foreground(), Trough(), Sum()]
 SKY = One(Spectrum, name="sky")
+SIGNAL = ("signal", "component")
 
-
-def posterior(data: np.ndarray) -> Posterior:
-    """The posterior of our parameters, given a measured sky spectrum."""
-    term = LikelihoodTerm("radiometer", radiometer, data, SKY)
-    return Posterior(params, stages, likelihoods=[term])
+model = Posterior(
+    params,
+    stages,
+    likelihoods=[LikelihoodTerm("radiometer", radiometer, SKY)],
+    derived=[SIGNAL],
+)
 ```
+
+We have not given the term any data yet: we do not have a measurement.
 
 ## Mock data
 
-We do not have a real measurement, so we make a mock one, at known true values of the
-parameters. `posterior.simulate` does this: at a given point, it draws data from each
-term's likelihood, given the model that term would score. It does not look at the
-data, so we can build a posterior on a placeholder to make the mock, and then build
-the posterior we will sample on the mock itself:
+Instead of a real measurement, we make a mock one, at known true values of the
+parameters. `simulate` does this: at a given point, it draws data from each term's
+likelihood, given the model output that term scores. It returns the data of each term
+by name, and `with_data` returns the posterior with those data, ready to be sampled:
 
 ```{code-cell} python
 truth = np.array([1000.0, -2.5, 0.5, 78.0, 5.0])
-mock = posterior(np.zeros(NU.size)).simulate(truth, rng)["radiometer"]
-post = posterior(mock)
+mocks = model.simulate(truth, rng)
+post = model.with_data(mocks)
+mock = mocks["radiometer"]
 post.names
 ```
 
@@ -200,12 +204,12 @@ bottom.legend();
 ## The log-likelihood
 
 With data and a posterior, we can score any point of the parameter space.
-`log_likelihood` returns the log-likelihood, along with any outputs listed as
-`derived` when the posterior was made (here none), as blobs. At the true values:
+`log_likelihood` returns the log-likelihood, along with the outputs listed as
+`derived` when the posterior was made, as blobs: here, the signal. At the true values:
 
 ```{code-cell} python
 lnl, blobs = post.log_likelihood(truth)
-lnl
+lnl, blobs[SIGNAL].values.min()
 ```
 
 ```{code-cell} python
@@ -219,27 +223,30 @@ data very badly, which is why we need a sampler to find the region of good fits.
 ## Sampling the posterior
 
 We now explore the posterior with a sampler. A posterior gives a sampler what it
-needs: `ndim`, `names`, `log_prior`, `prior_transform` and `log_likelihood`. Here we
-use [emcee](https://emcee.readthedocs.io), an MCMC sampler. It needs one function,
-the log posterior, which we write from the log prior and the log-likelihood. emcee can
-call it on all its walkers at once, which `yabf` evaluates as a batch:
+needs: `ndim`, `names`, `log_prior`, `prior_transform`, `log_likelihood` and
+`log_posterior`. Here we use [emcee](https://emcee.readthedocs.io), an MCMC sampler.
+It needs one function, the log posterior, which `post.log_posterior` provides. Like
+`log_likelihood`, it also returns the blobs, which emcee can store at each step of
+the chain: we keep the signal, so that we do not have to compute it again later.
+emcee calls the function on all its walkers at once, which `yabf` evaluates as a
+batch, and expects one log posterior and one blob per walker:
 
 ```{code-cell} python
-def log_posterior(theta: np.ndarray) -> np.ndarray:
-    """The log posterior of a batch of points; -inf outside the prior."""
-    out = post.log_prior(theta)
-    inside = np.isfinite(out)
-    if inside.any():
-        out[inside] += post.log_likelihood(theta[inside])[0]
-    return out
+def log_prob(theta: np.ndarray) -> list[tuple[float, Spectrum]]:
+    """The log posterior of each walker, with the signal at its position."""
+    lp, blobs = post.log_posterior(theta)
+    return list(zip(lp, blobs[SIGNAL], strict=True))
 
 
 nwalkers = 32
 start = post.params.gaussian_ball(nwalkers, rng, center=truth)
-sampler = emcee.EnsembleSampler(nwalkers, post.ndim, log_posterior, vectorize=True)
+sampler = emcee.EnsembleSampler(
+    nwalkers, post.ndim, log_prob, vectorize=True, blobs_dtype=object
+)
 sampler.run_mcmc(start, 4000, progress=False)
 print("autocorrelation times:", sampler.get_autocorr_time(quiet=True).round())
 chain = sampler.get_chain(discard=1000, thin=25, flat=True)
+signals = sampler.get_blobs(discard=1000, thin=25, flat=True)
 ```
 
 Starting the walkers near the truth makes them converge quickly. With real data the
@@ -268,14 +275,14 @@ for name, mean, std, true in zip(post.names, chain.mean(0), chain.std(0), truth)
 The mean of each parameter is within about one standard deviation of the truth. The
 foreground, being so bright, is measured far more precisely than the trough.
 
-Finally, to see what the posterior means for the signal itself, we run the model at
-100 points drawn from it, and plot the trough at each. Together they show the range
-of signals the data allow:
+Finally, to see what the posterior means for the signal itself, we plot the signal
+stored with 100 of the samples. Together they show the range of signals the data
+allow:
 
 ```{code-cell} python
 fig, ax = plt.subplots(figsize=(6, 3.5))
-for theta in chain[rng.choice(len(chain), 100)]:
-    ax.plot(NU, post.forward(theta)["signal", "component"].values, color="C0", alpha=0.1)
+for s in signals[rng.choice(len(signals), 100)]:
+    ax.plot(NU, s.values, color="C0", alpha=0.1)
 ax.plot(NU, out["signal", "component"].values, "k--", label="truth")
 ax.set_xlabel(r"$\nu$ [MHz]")
 ax.set_ylabel("T [K]")
@@ -289,37 +296,35 @@ own instrument. Here we add a second radiometer, twice as noisy, whose gain is
 uncertain. Both measure the same sky, so the sky should be computed once, and only the
 instrument effect should differ between them.
 
-A likelihood term can apply instrument effects of its own before scoring the model, in
-its `forward` stages. So the two measurements are two terms scoring one shared sky
-spectrum, the second through its own gain stage. Each term provides the model it
-scored as its output `"scored"`:
+An instrument effect for one data set is a stage like any other. Our `Gain` stage
+takes the sky and provides the `"observed"` spectrum, so the first term scores the
+sky, and the second the observed spectrum. The sky is computed once, for both:
 
 ```{code-cell} python
 second = Gaussian.from_sigma(np.full(NU.size, 2 * SIGMA))
 signal = Trough()
+two_model = Posterior(
+    [*params, Param("gain", prior=(0.98, 1.02))],
+    [Foreground(), signal, Sum(), Gain()],
+    likelihoods=[
+        LikelihoodTerm("radiometer", radiometer, SKY),
+        LikelihoodTerm("second", second, One(Spectrum, name="observed")),
+    ],
+)
+two_model.scored
+```
 
+`scored` lists the output each term scores. We simulate both data sets at once, at a
+gain of 1.01, and check that the signal runs once per evaluation:
 
-def two_instruments(data: np.ndarray, second_data: np.ndarray) -> Posterior:
-    """The posterior given the spectra measured by both instruments."""
-    return Posterior(
-        [*params, Param("gain", prior=(0.98, 1.02))],
-        [Foreground(), signal, Sum()],
-        likelihoods=[
-            LikelihoodTerm("radiometer", radiometer, data, SKY),
-            LikelihoodTerm("second", second, second_data, SKY, forward=[Gain()]),
-        ],
-    )
-
-
+```{code-cell} python
 theta = np.append(truth, 1.01)
-placeholder = np.zeros(NU.size)
-mocks = two_instruments(placeholder, placeholder).simulate(theta, rng)
-two = two_instruments(mocks["radiometer"], mocks["second"])
+two = two_model.with_data(two_model.simulate(theta, rng))
 
 signal.runs.clear()
 out = two.forward(theta)
 print(len(signal.runs), "run of the signal")
-out["second", "scored"].values[:3] / out["radiometer", "scored"].values[:3]
+out["gain", "observed"].values[:3] / out["sum", "sky"].values[:3]
 ```
 
 The log-likelihood is the sum of the terms:
@@ -360,7 +365,7 @@ class UnknownNoise:
 unknown = Posterior(
     [*params, Param("noise", prior=(0.01, 0.2), latex=r"\sigma")],
     stages,
-    likelihoods=[LikelihoodTerm("radiometer", UnknownNoise(NU.size), mock, SKY)],
+    likelihoods=[LikelihoodTerm("radiometer", UnknownNoise(NU.size), SKY, data=mock)],
 )
 unknown.names
 ```
@@ -416,7 +421,7 @@ class NoisyForeground(Foreground):
 noisy = Posterior(
     params,
     [NoisyForeground(), Trough(), Sum()],
-    likelihoods=[LikelihoodTerm("radiometer", radiometer, mock, SKY)],
+    likelihoods=[LikelihoodTerm("radiometer", radiometer, SKY, data=mock)],
 )
 noisy.random_inputs
 ```
