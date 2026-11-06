@@ -1,28 +1,32 @@
-"""Sampled and fixed parameters, and the space they span.
+"""Sampled, fixed and derived parameters, and the space they span.
 
-A :class:`Param` is one parameter of an inference: sampled with a prior, fixed, or
-tied to other parameters. It feeds one model parameter, possibly through a named
-transform, so that the sampler can work in a convenient space: for example, sample
-``log10_L_X`` uniformly and feed ``L_X = 10**log10_L_X`` to the model.
+A :class:`Param` is one parameter of an inference, sampled with a prior or fixed to a
+value. A :class:`DerivedParam` is computed from other parameters by a function. It
+lets the sampler work in a convenient space: for example, sample ``log10_L_X``
+uniformly and derive ``L_X = 10**log10_L_X`` for the model. It also ties one parameter
+to others, as in ``F_STAR7_MINI = F_STAR10 - 3 * ALPHA_STAR``.
 
-A tied parameter is computed from other model parameters by a named relation, such as
-``equal`` or ``linear``. Relations are named, like transforms, so that a parameter
-space can be written to and read from a configuration file.
+A derived parameter can refer to its function by name, as a configuration file would,
+once the function is registered with :func:`register_relation`. The functions
+``identity``, ``pow10``, ``log10``, ``exp``, ``log`` and ``stack`` are registered
+already.
 
-A model parameter can also be a vector: each of its elements is fed by its own
-parameter, and :func:`param_vector` builds them, ``beta_0``, ``beta_1``, ... for a
-vector ``beta``. Parameters can share a joint prior, such as a multivariate normal: each
-takes a :class:`~yabf.priors.Marginal` of it as its prior.
+A vector parameter is derived from its elements by ``stack``: :func:`param_vector`
+builds the elements ``beta_0``, ``beta_1``, ... and the vector ``beta`` made of them.
+Parameters can share a joint prior, such as a multivariate normal: each takes a
+:class:`~yabf.priors.Marginal` of it as its prior.
 
 A :class:`ParamSpace` is an ordered collection of parameters. It provides what samplers
 need, vectorised over any leading batch dimensions: the prior transform from the unit
 hypercube, the log prior density, draws from the prior and a Gaussian ball around the
-fiducial point for initialising walkers.
+fiducial point for initialising walkers. It also computes the value of every parameter,
+derived ones included, at a point of the sampled space.
 """
 
 from __future__ import annotations
 
 import graphlib
+import inspect
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import cached_property
 
@@ -32,43 +36,56 @@ from numpy.typing import ArrayLike
 
 from .priors import JointPrior, Marginal, Prior, as_prior
 
-
-@attrs.frozen
-class Transform:
-    """A named, vectorised map from sampled values to model values, with its inverse."""
-
-    name: str
-    forward: Callable[[np.ndarray], np.ndarray]
-    inverse: Callable[[np.ndarray], np.ndarray]
+_RELATIONS: dict[str, Callable[..., np.ndarray]] = {}
 
 
-_TRANSFORMS: dict[str, Transform] = {}
+def _origin(function: Callable) -> tuple[str | None, str | None]:
+    """Return where ``function`` is defined: its module and qualified name."""
+    return getattr(function, "__module__", None), getattr(
+        function, "__qualname__", None
+    )
 
 
-def register_transform(
-    name: str,
-    forward: Callable[[np.ndarray], np.ndarray],
-    inverse: Callable[[np.ndarray], np.ndarray],
-) -> Transform:
-    """Register a transform under ``name``, so that a :class:`Param` can refer to it.
+def register_relation(
+    function: Callable[..., np.ndarray] | None = None, /, *, name: str | None = None
+) -> Callable:
+    """Register a function, so that a :class:`DerivedParam` can refer to it by name.
 
-    Both functions must be vectorised, and ``inverse`` must undo ``forward``. This is
-    not checked: test a new transform over the range of values it will be used on.
+    Use it as a decorator: ``@register_relation`` registers the function under its own
+    name, and ``@register_relation(name="...")`` under the name given. The function is
+    returned unchanged, so it can still be called directly.
+
+    The function must be vectorised. It receives one array per input, with the same
+    leading (batch) dimensions, and returns an array with those leading dimensions.
+
+    A name can be registered once. Registering the same function again, as when a
+    notebook cell is run twice, replaces it.
+
+    Examples
+    --------
+    >>> @register_relation
+    ... def radius(x, y):
+    ...     return np.hypot(x, y)
     """
-    if name in _TRANSFORMS:
-        raise ValueError(f"A transform named '{name}' is already registered.")
-    transform = Transform(name=name, forward=forward, inverse=inverse)
-    _TRANSFORMS[name] = transform
-    return transform
+
+    def register(f: Callable[..., np.ndarray]) -> Callable[..., np.ndarray]:
+        """Register ``f`` and return it."""
+        key = f.__name__ if name is None else name
+        if key in _RELATIONS and _origin(_RELATIONS[key]) != _origin(f):
+            raise ValueError(f"A relation named '{key}' is already registered.")
+        _RELATIONS[key] = f
+        return f
+
+    return register if function is None else register(function)
 
 
-def get_transform(name: str) -> Transform:
-    """Return the registered transform called ``name``."""
+def get_relation(name: str) -> Callable[..., np.ndarray]:
+    """Return the function registered as ``name``."""
     try:
-        return _TRANSFORMS[name]
+        return _RELATIONS[name]
     except KeyError:
         raise ValueError(
-            f"Unknown transform '{name}'. Registered transforms: {sorted(_TRANSFORMS)}."
+            f"Unknown relation '{name}'. Registered relations: {sorted(_RELATIONS)}."
         ) from None
 
 
@@ -78,141 +95,153 @@ def _identity(x: np.ndarray) -> np.ndarray:
 
 
 def _pow10(x: np.ndarray) -> np.ndarray:
-    """Return ``10**x``; the inverse of :func:`numpy.log10`."""
+    """Return ``10**x``."""
     return 10.0**x
 
 
-register_transform("identity", _identity, _identity)
-register_transform("pow10", _pow10, np.log10)
-register_transform("log10", np.log10, _pow10)
-register_transform("exp", np.exp, np.log)
-register_transform("log", np.log, np.exp)
+def _stack(*elements: np.ndarray) -> np.ndarray:
+    """Stack the elements of a vector along a new last axis."""
+    return np.stack(np.broadcast_arrays(*elements), axis=-1)
 
 
-@attrs.frozen
-class Relation:
-    """A named, vectorised function computing a model parameter from others.
-
-    The function is called with the input values as positional arguments, followed by
-    the tie's keyword arguments.
-    """
-
-    name: str
-    function: Callable[..., np.ndarray]
+register_relation(_identity, name="identity")
+register_relation(_pow10, name="pow10")
+register_relation(np.log10, name="log10")
+register_relation(np.exp, name="exp")
+register_relation(np.log, name="log")
+register_relation(_stack, name="stack")
 
 
-_RELATIONS: dict[str, Relation] = {}
+def _resolve(function: Callable[..., np.ndarray] | str) -> Callable[..., np.ndarray]:
+    """Return ``function``, looking it up if it is the name of a registered one."""
+    return get_relation(function) if isinstance(function, str) else function
 
 
-def register_relation(name: str, function: Callable[..., np.ndarray]) -> Relation:
-    """Register a relation under ``name``, so that a :class:`Tie` can refer to it.
-
-    The function must be vectorised: it receives one array per input, all of the same
-    shape, and returns an array of that shape.
-    """
-    if name in _RELATIONS:
-        raise ValueError(f"A relation named '{name}' is already registered.")
-    relation = Relation(name=name, function=function)
-    _RELATIONS[name] = relation
-    return relation
+def _check_function(
+    inst: DerivedParam, att: attrs.Attribute, value: Callable | str
+) -> None:
+    """Check that ``function`` is callable, or names a registered relation."""
+    if not callable(_resolve(value)):
+        raise TypeError(
+            f"The function of '{inst.name}' must be callable, or the name of a "
+            f"registered relation; got {value!r}."
+        )
 
 
-def get_relation(name: str) -> Relation:
-    """Return the registered relation called ``name``."""
+def _signature(function: Callable) -> inspect.Signature | None:
+    """Return the signature of ``function``, or None if it cannot be read."""
     try:
-        return _RELATIONS[name]
-    except KeyError:
-        raise ValueError(
-            f"Unknown relation '{name}'. Registered relations: {sorted(_RELATIONS)}."
-        ) from None
+        return inspect.signature(function)
+    except (TypeError, ValueError):
+        return None
 
 
-def _equal(x: np.ndarray) -> np.ndarray:
-    """Return the single input unchanged: the tied parameter equals its input."""
-    return x
-
-
-def _linear(
-    *xs: np.ndarray, coefficients: Sequence[float], offset: float = 0.0
-) -> np.ndarray:
-    """Return ``offset + sum(c * x)`` over the inputs and their ``coefficients``."""
-    return offset + sum(c * x for c, x in zip(coefficients, xs, strict=True))
-
-
-register_relation("equal", _equal)
-register_relation("linear", _linear)
-
-
-def _frozen_kwargs(
-    kwargs: Mapping[str, object] | Iterable[tuple[str, object]],
-) -> tuple[tuple[str, object], ...]:
-    """Return keyword arguments as sorted ``(name, value)`` pairs, lists as tuples."""
-    return tuple(
-        (k, tuple(v) if isinstance(v, list) else v)
-        for k, v in sorted(dict(kwargs).items())
-    )
+def _input_names(
+    inputs: str | Param | DerivedParam | Iterable[str | Param | DerivedParam],
+) -> tuple[str, ...]:
+    """Return the names of ``inputs``: parameters, names, or a sequence of either."""
+    if isinstance(inputs, str | Param | DerivedParam):
+        inputs = (inputs,)
+    return tuple(p if isinstance(p, str) else p.name for p in inputs)
 
 
 @attrs.frozen
-class Tie:
-    """A model parameter computed from other model parameters by a named relation.
+class DerivedParam:
+    """A parameter computed from other parameters by a function.
+
+    A derived parameter is not sampled, and has no prior of its own: its distribution
+    follows from the priors of the parameters it is computed from.
 
     Parameters
     ----------
-    relation
-        The name of a registered relation.
+    name
+        The name of the parameter.
+    function
+        A vectorised function, or the name of one registered with
+        :func:`register_relation`. It is called with the values of ``inputs``, in order.
     inputs
-        The model parameters passed to the relation, in order.
-    kwargs
-        Keyword arguments passed to the relation. They are stored as sorted
-        ``(name, value)`` pairs, with lists turned into tuples, so that a tie is
-        immutable and hashable.
+        The parameters passed to ``function``: their names, or the parameters
+        themselves. Each may be sampled, fixed or derived. Defaults to the names of the
+        function's required arguments.
+    latex
+        A LaTeX label for plots. Defaults to ``name``.
 
     Examples
     --------
-    ``F_STAR7 = F_STAR10 - 3 * ALPHA_STAR``:
+    Sample the logarithm of an amplitude, and give the model the amplitude itself:
 
-    >>> tie = Tie("linear", ("F_STAR10", "ALPHA_STAR"), {"coefficients": (1, -3)})
+    >>> log_amp = Param("log10_amp", prior=(2.0, 4.0))
+    >>> amp = DerivedParam("amp", "pow10", log_amp)
+
+    Derive a parameter from two others, taking the inputs from the function's
+    arguments:
+
+    >>> def radius(x, y):
+    ...     return np.hypot(x, y)
+    >>> r = DerivedParam("r", radius)
+    >>> r.inputs
+    ('x', 'y')
+
+    Give the inputs when their names are not the function's arguments:
+
+    >>> def f_star7_mini(f_star10, alpha_star):
+    ...     return f_star10 - 3 * alpha_star
+    >>> f7 = DerivedParam("F_STAR7_MINI", f_star7_mini, ["F_STAR10", "ALPHA_STAR"])
     """
 
-    relation: str = attrs.field()
-    inputs: tuple[str, ...] = attrs.field(converter=tuple)
-    kwargs: tuple[tuple[str, object], ...] = attrs.field(
-        factory=tuple, converter=_frozen_kwargs
-    )
+    name: str = attrs.field(validator=attrs.validators.instance_of(str))
+    function: Callable[..., np.ndarray] | str = attrs.field(validator=_check_function)
+    inputs: tuple[str, ...] = attrs.field(converter=_input_names)
+    latex: str = attrs.field(kw_only=True)
 
-    @relation.validator
-    def _relation_validator(self, att: attrs.Attribute, value: str) -> None:
-        """Check that ``relation`` names a registered relation."""
-        get_relation(value)
+    @inputs.default
+    def _inputs_default(self) -> tuple[str, ...]:
+        """Default the inputs to the names of the function's required arguments."""
+        sig = _signature(self.func)
+        kinds = (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        if sig is None or any(
+            a.kind is inspect.Parameter.VAR_POSITIONAL for a in sig.parameters.values()
+        ):
+            raise TypeError(
+                f"Give the inputs of '{self.name}': they cannot be read from the "
+                f"arguments of {self.function!r}."
+            )
+        return tuple(
+            a.name
+            for a in sig.parameters.values()
+            if a.kind in kinds and a.default is inspect.Parameter.empty
+        )
+
+    @latex.default
+    def _latex_default(self) -> str:
+        """Default the LaTeX label to the parameter's name."""
+        return self.name
+
+    def __attrs_post_init__(self) -> None:
+        """Check that the function can take the inputs."""
+        sig = _signature(self.func)
+        if sig is None:
+            return
+        try:
+            sig.bind(*self.inputs)
+        except TypeError:
+            raise TypeError(
+                f"Parameter '{self.name}' passes {len(self.inputs)} input(s), "
+                f"{list(self.inputs)}, to {self.function!r}, which does not accept "
+                "them."
+            ) from None
+
+    @property
+    def func(self) -> Callable[..., np.ndarray]:
+        """The function computing the parameter."""
+        return _resolve(self.function)
 
     def __call__(self, values: Mapping[str, np.ndarray]) -> np.ndarray:
-        """Evaluate the relation on the inputs taken from ``values``."""
-        args = [values[name] for name in self.inputs]
-        return get_relation(self.relation).function(*args, **dict(self.kwargs))
-
-
-def as_tie(tie: Tie | str | Mapping[str, float]) -> Tie:
-    """Return ``tie`` as a :class:`Tie`.
-
-    A string ``"x"`` ties the parameter to equal the model parameter ``x``. A mapping
-    ``{"x": a, "y": b}`` ties it to ``a * x + b * y``.
-    """
-    if isinstance(tie, Tie):
-        return tie
-    if isinstance(tie, str):
-        return Tie("equal", (tie,))
-    if isinstance(tie, Mapping):
-        return Tie("linear", tuple(tie), {"coefficients": tuple(tie.values())})
-    raise TypeError(
-        "A tie must be a Tie, the name of a model parameter, or a mapping of model "
-        f"parameters to coefficients; got {tie!r}."
-    )
-
-
-def _check_transform(inst: Param, att: attrs.Attribute, value: str) -> None:
-    """Check that ``transform`` names a registered transform."""
-    get_transform(value)
+        """Compute the parameter from the values of its inputs, taken by name."""
+        return self.func(*(values[name] for name in self.inputs))
 
 
 def _optional_prior(value: Prior | tuple[float, float] | None) -> Prior | None:
@@ -220,40 +249,23 @@ def _optional_prior(value: Prior | tuple[float, float] | None) -> Prior | None:
     return None if value is None else as_prior(value)
 
 
-def _optional_tie(value: Tie | str | Mapping[str, float] | None) -> Tie | None:
-    """Convert ``value`` with :func:`as_tie`, keeping ``None``."""
-    return None if value is None else as_tie(value)
-
-
 @attrs.frozen
 class Param:
-    """A parameter of an inference: sampled with a prior, fixed, or tied.
+    """A parameter of an inference, sampled with a prior or fixed to a value.
 
     Parameters
     ----------
     name
-        The name of the parameter, as the sampler sees it.
+        The name of the parameter.
     prior
         The prior: a ``(low, high)`` tuple for a uniform prior, or any object with
         ``logpdf`` and ``ppf`` methods, such as a frozen scipy distribution. Give
-        exactly one of a prior, a fixed value or a tie.
+        exactly one of a prior or a fixed value.
     fixed
-        A fixed value. A fixed parameter is not sampled, but still feeds the model.
-    tied
-        A :class:`Tie` computing this parameter's model value from other model
-        parameters; see :func:`as_tie` for the short forms. A tied parameter is not
-        sampled and takes no transform.
+        A fixed value. A fixed parameter is not sampled, but its value still reaches the
+        model.
     fiducial
-        A reference value, in the sampled space. Defaults to the fixed value or the
-        median of the prior; not defined for a tied parameter.
-    feeds
-        The model parameter this one determines. Defaults to ``name``.
-    index
-        If given, this parameter determines element ``index`` of the vector model
-        parameter ``feeds``, whose elements are all fed by parameters of the same
-        space. A tied parameter cannot be an element.
-    transform
-        The name of a registered transform applied before the value reaches the model.
+        A reference value. Defaults to the fixed value or the median of the prior.
     latex
         A LaTeX label for plots. Defaults to ``name``.
     """
@@ -265,17 +277,7 @@ class Param:
     fixed: float | None = attrs.field(
         default=None, converter=attrs.converters.optional(float), kw_only=True
     )
-    tied: Tie | None = attrs.field(default=None, converter=_optional_tie, kw_only=True)
     fiducial: float = attrs.field(converter=float, kw_only=True)
-    feeds: str = attrs.field(kw_only=True)
-    index: int | None = attrs.field(
-        default=None,
-        kw_only=True,
-        validator=attrs.validators.optional(attrs.validators.ge(0)),
-    )
-    transform: str = attrs.field(
-        default="identity", validator=_check_transform, kw_only=True
-    )
     latex: str = attrs.field(kw_only=True)
 
     @fiducial.default
@@ -284,13 +286,8 @@ class Param:
         if self.fixed is not None:
             return self.fixed
         if self.prior is None:
-            return np.nan  # tied, or rejected in __attrs_post_init__
+            return np.nan  # rejected in __attrs_post_init__
         return self.prior.ppf(0.5)
-
-    @feeds.default
-    def _feeds_default(self) -> str:
-        """Default the fed model parameter to the parameter's own name."""
-        return self.name
 
     @latex.default
     def _latex_default(self) -> str:
@@ -299,21 +296,10 @@ class Param:
 
     def __attrs_post_init__(self) -> None:
         """Check that the parameter is fully and consistently specified."""
-        given = [x is not None for x in (self.prior, self.fixed, self.tied)]
-        if sum(given) != 1:
+        if (self.prior is None) == (self.fixed is None):
             raise ValueError(
-                f"Parameter '{self.name}' needs exactly one of a prior, a fixed value "
-                "or a tie."
-            )
-        if self.is_tied and self.transform != "identity":
-            raise ValueError(
-                f"Parameter '{self.name}' is tied, so its value comes from its "
-                "relation and it takes no transform."
-            )
-        if self.is_tied and self.index is not None:
-            raise ValueError(
-                f"Parameter '{self.name}' is tied, so it cannot be an element of a "
-                "vector; tie the whole vector instead."
+                f"Parameter '{self.name}' needs exactly one of a prior or a fixed "
+                "value."
             )
         if self.prior is not None and not self.prior.logpdf(self.fiducial) > -np.inf:
             raise ValueError(
@@ -327,18 +313,9 @@ class Param:
         return self.fixed is not None
 
     @property
-    def is_tied(self) -> bool:
-        """Whether the parameter is tied to other parameters."""
-        return self.tied is not None
-
-    @property
     def is_sampled(self) -> bool:
         """Whether the parameter is sampled."""
         return self.prior is not None
-
-    def to_model(self, value: ArrayLike) -> np.ndarray:
-        """Map a value in the sampled space to the value the model receives."""
-        return get_transform(self.transform).forward(value)
 
 
 def _unique(kind: str, values: Sequence[str]) -> None:
@@ -348,25 +325,6 @@ def _unique(kind: str, values: Sequence[str]) -> None:
         (dupes if v in seen else seen).add(v)
     if dupes:
         raise ValueError(f"Duplicate parameter {kind}: {sorted(dupes)}.")
-
-
-def _check_feeds(params: Sequence[Param]) -> None:
-    """Check that each model parameter is fed once, or element by element."""
-    by_feeds: dict[str, list[Param]] = {}
-    for p in params:
-        by_feeds.setdefault(p.feeds, []).append(p)
-    _unique("feeds", [p.feeds for p in params if p.index is None])
-    for feeds, ps in by_feeds.items():
-        indices = sorted(p.index for p in ps if p.index is not None)
-        if indices and len(indices) < len(ps):
-            raise ValueError(
-                f"Model parameter '{feeds}' is fed both whole and element by element."
-            )
-        if indices and indices != list(range(len(ps))):
-            raise ValueError(
-                f"The elements of model parameter '{feeds}' must have the indices 0 to "
-                f"{len(ps) - 1}, each once; got {indices}."
-            )
 
 
 def _joint_groups(sampled: Sequence[Param]) -> list[tuple[JointPrior, list[int]]]:
@@ -397,23 +355,27 @@ def _joint_groups(sampled: Sequence[Param]) -> list[tuple[JointPrior, list[int]]
     return out
 
 
-def _tie_order(params: Sequence[Param]) -> tuple[Param, ...]:
-    """Order the tied parameters so that each comes after the ties it depends on."""
-    tied = {p.feeds: p for p in params if p.is_tied}
-    known = {p.feeds for p in params}
+def _derivation_order(
+    params: Sequence[Param | DerivedParam],
+) -> tuple[DerivedParam, ...]:
+    """Order the derived parameters, each after the parameters it is derived from."""
+    derived = {p.name: p for p in params if isinstance(p, DerivedParam)}
+    known = {p.name for p in params}
     graph = {}
-    for feeds, p in tied.items():
-        missing = sorted(set(p.tied.inputs) - known)
+    for name, p in derived.items():
+        missing = [i for i in p.inputs if i not in known]
         if missing:
             raise ValueError(
-                f"Parameter '{p.name}' is tied to {missing}, which no parameter feeds."
+                f"Parameter '{name}' is derived from {missing}, which the parameter "
+                "space does not define."
             )
-        graph[feeds] = {name for name in p.tied.inputs if name in tied}
+        graph[name] = {i for i in p.inputs if i in derived}
     try:
-        order = graphlib.TopologicalSorter(graph).static_order()
-        return tuple(tied[feeds] for feeds in order)
+        return tuple(
+            derived[n] for n in graphlib.TopologicalSorter(graph).static_order()
+        )
     except graphlib.CycleError as e:
-        raise ValueError(f"Parameter ties form a cycle: {e.args[1]}.") from None
+        raise ValueError(f"Derived parameters form a cycle: {e.args[1]}.") from None
 
 
 @attrs.frozen
@@ -424,24 +386,24 @@ class ParamSpace:
     methods taking ``theta`` or ``u`` accept arrays of shape ``(..., ndim)`` and are
     vectorised over the leading dimensions.
 
-    A tie's inputs must be model parameters fed by parameters in the space, and ties
-    may depend on other ties as long as they do not form a cycle. The elements of a
-    vector model parameter must all be in the space, and so must every parameter of a
-    joint prior, sampled.
+    A derived parameter's inputs must be parameters of the space, and derived
+    parameters may depend on other derived parameters as long as they do not form a
+    cycle. Every parameter of a joint prior must be in the space, and sampled.
     """
 
-    params: tuple[Param, ...] = attrs.field(converter=tuple)
+    params: tuple[Param | DerivedParam, ...] = attrs.field(converter=tuple)
 
     @params.validator
-    def _params_validator(self, att: attrs.Attribute, value: tuple[Param, ...]) -> None:
+    def _params_validator(
+        self, att: attrs.Attribute, value: tuple[Param | DerivedParam, ...]
+    ) -> None:
         """Check that the parameters form a consistent space."""
         for p in value:
-            if not isinstance(p, Param):
-                raise TypeError(f"Expected Param instances, got {p!r}.")
+            if not isinstance(p, Param | DerivedParam):
+                raise TypeError(f"Expected Param or DerivedParam instances, got {p!r}.")
         _unique("names", [p.name for p in value])
-        _check_feeds(value)
-        _tie_order(value)
-        _joint_groups([p for p in value if p.is_sampled])
+        _derivation_order(value)
+        _joint_groups([p for p in value if isinstance(p, Param) and p.is_sampled])
 
     @cached_property
     def _joint(self) -> list[tuple[JointPrior, list[int]]]:
@@ -455,20 +417,34 @@ class ParamSpace:
             i for i, p in enumerate(self.sampled) if not isinstance(p.prior, Marginal)
         ]
 
+    @cached_property
+    def _order(self) -> tuple[DerivedParam, ...]:
+        """The derived parameters, each after those it is derived from."""
+        return _derivation_order(self.params)
+
+    @cached_property
+    def _by_name(self) -> dict[str, Param | DerivedParam]:
+        """Every parameter, by name."""
+        return {p.name: p for p in self.params}
+
+    def __contains__(self, name: object) -> bool:
+        """Whether the space has a parameter called ``name``."""
+        return name in self._by_name
+
     @property
     def sampled(self) -> tuple[Param, ...]:
         """The sampled parameters, in order."""
-        return tuple(p for p in self.params if p.is_sampled)
+        return tuple(p for p in self.params if isinstance(p, Param) and p.is_sampled)
 
     @property
     def fixed(self) -> tuple[Param, ...]:
         """The fixed parameters."""
-        return tuple(p for p in self.params if p.is_fixed)
+        return tuple(p for p in self.params if isinstance(p, Param) and p.is_fixed)
 
     @property
-    def tied(self) -> tuple[Param, ...]:
-        """The tied parameters."""
-        return tuple(p for p in self.params if p.is_tied)
+    def derived(self) -> tuple[DerivedParam, ...]:
+        """The derived parameters."""
+        return tuple(p for p in self.params if isinstance(p, DerivedParam))
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -484,6 +460,18 @@ class ParamSpace:
     def fiducial(self) -> np.ndarray:
         """The fiducial values of the sampled parameters."""
         return np.array([p.fiducial for p in self.sampled])
+
+    def upstream(self, name: str) -> frozenset[str]:
+        """The parameter ``name`` and all the parameters it is derived from."""
+        out, todo = set(), [name]
+        while todo:
+            n = todo.pop()
+            if n not in out:
+                out.add(n)
+                p = self._by_name[n]
+                if isinstance(p, DerivedParam):
+                    todo.extend(p.inputs)
+        return frozenset(out)
 
     def _check_shape(self, x: ArrayLike, what: str) -> np.ndarray:
         """Return ``x`` as a float array, checking its last axis has length ``ndim``."""
@@ -515,30 +503,18 @@ class ParamSpace:
         return total
 
     def to_model(self, theta: ArrayLike) -> dict[str, np.ndarray]:
-        """Return the model parameters for ``theta``, keyed by the names they feed.
+        """Return the value of every parameter at ``theta``, by name.
 
-        Sampled values are transformed, fixed values are broadcast to the batch shape
-        of ``theta``, the elements of each vector are stacked along a last axis, and
-        tied values are computed from the others.
+        Sampled values are taken from ``theta``, fixed values are broadcast to its batch
+        shape, and derived values are computed from the others. A model takes the values
+        it needs from these by name.
         """
         theta = self._check_shape(theta, "theta")
-        out, elements = {}, {}
-
-        def put(p: Param, value: np.ndarray) -> None:
-            """Store ``value`` as the model value, or vector element, ``p`` feeds."""
-            if p.index is None:
-                out[p.feeds] = value
-            else:
-                elements.setdefault(p.feeds, {})[p.index] = value
-
-        for i, p in enumerate(self.sampled):
-            put(p, p.to_model(theta[..., i]))
+        out = {p.name: theta[..., i] for i, p in enumerate(self.sampled)}
         for p in self.fixed:
-            put(p, np.broadcast_to(p.to_model(p.fixed), theta.shape[:-1]))
-        for feeds, values in elements.items():
-            out[feeds] = np.stack([values[i] for i in range(len(values))], axis=-1)
-        for p in _tie_order(self.params):
-            out[p.feeds] = p.tied(out)
+            out[p.name] = np.broadcast_to(p.fixed, theta.shape[:-1])
+        for p in self._order:
+            out[p.name] = np.asarray(p(out))
         return out
 
     def sample_prior(self, n: int, rng: np.random.Generator) -> np.ndarray:
@@ -604,14 +580,17 @@ def param_vector(
     | None = None,
     fixed: Mapping[int, float] | Sequence[float] | None = None,
     fiducial: float | Sequence[float] | None = None,
-    feeds: str | None = None,
-    transform: str = "identity",
     latex: str | None = None,
-) -> tuple[Param, ...]:
-    """Build the parameters that feed the elements of a vector model parameter.
+) -> tuple[Param | DerivedParam, ...]:
+    """Build a vector parameter and the parameters of its elements.
 
-    Element ``i`` is the parameter ``f"{name}_{i}"``, feeding element ``i`` of the
-    model parameter ``feeds`` (default: ``name``).
+    Element ``i`` is the parameter ``f"{name}_{i}"``, and the vector is the derived
+    parameter ``name``, which stacks the elements along a last axis. The elements come
+    first in the returned tuple, and the vector last.
+
+    To sample a vector in a different space, derive a new vector from this one: for
+    example, ``DerivedParam("beta", "pow10", "log10_beta")`` after
+    ``param_vector("log10_beta", ...)``.
 
     Parameters
     ----------
@@ -629,8 +608,9 @@ def param_vector(
         being sampled, or a sequence fixing every element.
     fiducial
         The fiducial value of the sampled elements: one value, or one per element.
-    feeds, transform, latex
-        As for :class:`Param`; ``latex`` gets the element index as a subscript.
+    latex
+        A LaTeX label for the vector (default: ``name``). The elements get it with
+        their index as a subscript.
 
     Examples
     --------
@@ -668,12 +648,7 @@ def param_vector(
 
     params = []
     for i in range(n):
-        kw = {
-            "feeds": feeds or name,
-            "index": i,
-            "transform": transform,
-            "latex": f"{latex or name}_{{{i}}}",
-        }
+        kw = {"latex": f"{latex or name}_{{{i}}}"}
         if i in fixed:
             params.append(Param(f"{name}_{i}", fixed=fixed[i], **kw))
             continue
@@ -688,4 +663,5 @@ def param_vector(
         if fiducial is not None:
             kw["fiducial"] = _element(fiducial, i)
         params.append(Param(f"{name}_{i}", prior=element_prior, **kw))
-    return tuple(params)
+    vector = DerivedParam(name, "stack", params, latex=latex or name)
+    return (*params, vector)

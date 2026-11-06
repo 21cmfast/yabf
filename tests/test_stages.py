@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from yabf import priors
-from yabf.params import Param, ParamSpace, param_vector
+from yabf.params import DerivedParam, Param, ParamSpace, param_vector
 from yabf.stages import (
     REQUIRED,
     All,
@@ -332,19 +332,24 @@ def test_parameters_that_no_stage_takes_are_reported():
         [
             Param("sigma", prior=(0.5, 2.0)),
             Param("F_STAR10", prior=(-3.0, 0.0)),  # a typo or a deprecated name
-            Param("log10_x", prior=(0.0, 1.0), feeds="x", transform="pow10"),
+            Param("log10_x", prior=(0.0, 1.0)),
+            DerivedParam("x", "pow10", "log10_x"),
         ]
     )
     (problem,) = _problems(TOY, params)
-    assert problem == (
-        "No stage takes the parameters 'F_STAR10', 'log10_x' (feeds 'x')."
-    )
+    # 'log10_x' is unused because 'x' is, so only 'x' is named.
+    assert problem == "No stage takes the parameters 'F_STAR10', 'x'."
 
 
-def test_a_parameter_used_through_a_tie_counts_as_taken():
-    # 'base' reaches the simulator only as the input of the tied 'sigma'.
+def _times_three(base):
+    """Return three times ``base``."""
+    return 3.0 * base
+
+
+def test_a_parameter_used_through_a_derived_one_counts_as_taken():
+    # 'base' reaches the simulator only as the input of the derived 'sigma'.
     params = ParamSpace(
-        [Param("base", prior=(0.5, 2.0)), Param("sigma", tied={"base": 2.0})]
+        [Param("base", prior=(0.5, 2.0)), DerivedParam("sigma", _times_three)]
     )
     resolve(TOY, params)
 
@@ -467,10 +472,10 @@ class Bubbles:
         ),
         (
             [Simulator()],
-            [Param("sigma", prior=(5.0, 20.0))],
+            [Param("sigma", prior=(2.0, 15.0))],
             (
                 "Stage 'sim' rejects 'sigma' at the upper edge of the prior of "
-                "'sigma': the value 20 is outside [0, 10]."
+                "'sigma': the value 15 is outside [0, 10]."
             ),
         ),
         (
@@ -483,19 +488,25 @@ class Bubbles:
             ),
         ),
         (
-            # Domains apply to model values, after the transform.
+            # Domains apply to the values the stage receives, after the transform.
             [Simulator()],
-            [Param("log10_sigma", prior=(-1.0, 2.0), feeds="sigma", transform="pow10")],
+            [
+                Param("log10_sigma", prior=(-1.0, 2.0)),
+                DerivedParam("sigma", "pow10", "log10_sigma"),
+            ],
             (
                 "Stage 'sim' rejects 'sigma' at the upper edge of the prior of "
                 "'log10_sigma': the value 100 is outside [0, 10]."
             ),
         ),
         (
-            # Tied values are checked at points near the edges of their inputs' priors.
+            # Derived values are checked at the edges of their inputs' priors.
             [Simulator()],
-            [Param("base", prior=(1.0, 4.0)), Param("sigma", tied={"base": 3.0})],
-            "Stage 'sim' rejects 'sigma' with 'base' near the upper edge of its prior",
+            [Param("base", prior=(1.0, 4.0)), DerivedParam("sigma", _times_three)],
+            (
+                "Stage 'sim' rejects 'sigma' at the upper edge of the prior of "
+                "'base': the value 12 is outside [0, 10]."
+            ),
         ),
         (
             [Bubbles()],
@@ -521,7 +532,7 @@ class Bubbles:
         "prior_outside_domain",
         "unbounded_prior",
         "transformed_prior",
-        "tied_outside_domain",
+        "derived_outside_domain",
         "wrong_shape",
         "check_hook",
     ],
@@ -535,10 +546,13 @@ def test_parameters_a_stage_does_not_accept_are_reported(stages, params, expecte
     "params",
     [
         [Param("sigma", prior=(0.5, 10.0)), Param("seed", fixed=2)],
-        [Param("log10_sigma", prior=(-1.0, 1.0), feeds="sigma", transform="pow10")],
-        [Param("base", prior=(1.0, 3.0)), Param("sigma", tied={"base": 3.0})],
+        [
+            Param("log10_sigma", prior=(-1.0, 1.0)),
+            DerivedParam("sigma", "pow10", "log10_sigma"),
+        ],
+        [Param("base", prior=(1.0, 3.0)), DerivedParam("sigma", _times_three)],
     ],
-    ids=["bounded_prior", "transformed_prior", "tied"],
+    ids=["bounded_prior", "transformed_prior", "derived"],
 )
 def test_parameter_spaces_inside_the_domains_resolve(params):
     resolve([Simulator()], ParamSpace(params))
@@ -723,7 +737,7 @@ def test_a_vector_of_elements_feeds_a_vector_parameter():
         (
             param_vector("p", 3, prior=(-10.0, 10.0)),
             (
-                "Stage 'poly' rejects 'p' at the fiducial point: the value [0. 0. 0.] "
+                "Stage 'poly' rejects 'p' at the fiducial point: the value [0 0 0] "
                 "has shape (3,), not (4,)."
             ),
         ),
@@ -731,7 +745,7 @@ def test_a_vector_of_elements_feeds_a_vector_parameter():
             param_vector("p", 4, prior=[(-10, 10), (-10, 10), (-10, 200), (-10, 10)]),
             (
                 "Stage 'poly' rejects 'p' at the upper edge of the prior of 'p_2': the "
-                "value 200 is outside [-100, 100]."
+                "value [0 0 200 0] is outside [-100, 100]."
             ),
         ),
         (
@@ -740,7 +754,7 @@ def test_a_vector_of_elements_feeds_a_vector_parameter():
             param_vector("p", prior=priors.multivariate_normal(np.zeros(4), np.eye(4))),
             (
                 "Stage 'poly' rejects 'p' at the lower edge of the prior of 'p_0': the "
-                "value -inf is outside [-100, 100]."
+                "value [-inf 0 0 0] is outside [-100, 100]."
             ),
         ),
     ],

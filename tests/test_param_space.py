@@ -6,13 +6,11 @@ from scipy import stats
 
 from yabf import priors
 from yabf.params import (
+    DerivedParam,
     Param,
     ParamSpace,
-    Tie,
-    get_transform,
     param_vector,
     register_relation,
-    register_transform,
 )
 from yabf.priors import Marginal
 
@@ -22,9 +20,8 @@ def space():
     return ParamSpace(
         [
             Param("a", prior=(-1.0, 3.0)),
-            Param(
-                "log10_b", prior=priors.normal(1.0, 0.5), feeds="b", transform="pow10"
-            ),
+            Param("log10_b", prior=priors.normal(1.0, 0.5)),
+            DerivedParam("b", "pow10", "log10_b"),
             Param("c", fixed=2.0),
             Param("d", prior=stats.gamma(3.0)),
         ]
@@ -34,28 +31,6 @@ def space():
 def test_fixed_parameters_are_not_sampled(space):
     assert space.names == ("a", "log10_b", "d")
     assert space.ndim == 3
-
-
-_REALS = np.linspace(-6.0, 6.0, 49)
-_POSITIVE = np.logspace(-6.0, 6.0, 49)
-
-
-@pytest.mark.parametrize(
-    ("name", "domain"),
-    [
-        ("identity", _REALS),
-        ("pow10", _REALS),
-        ("log10", _POSITIVE),
-        ("exp", _REALS),
-        ("log", _POSITIVE),
-    ],
-)
-def test_transforms_are_inverted_by_their_inverse(name, domain):
-    t = get_transform(name)
-    np.testing.assert_allclose(t.inverse(t.forward(domain)), domain, rtol=1e-12)
-    # The image of the domain round-trips the other way too.
-    image = t.forward(domain)
-    np.testing.assert_allclose(t.forward(t.inverse(image)), image, rtol=1e-12)
 
 
 def test_prior_transform_draws_follow_each_marginal(space):
@@ -85,10 +60,10 @@ def test_unit_cube_centre_maps_to_the_prior_medians(space):
     np.testing.assert_allclose(space.prior_transform(np.full(3, 0.5)), space.fiducial)
 
 
-def test_to_model_applies_transforms_and_broadcasts_fixed_values(space):
+def test_to_model_derives_values_and_broadcasts_fixed_values(space):
     theta = np.array([[0.0, 2.0, 1.0], [1.0, -1.0, 4.0]])
     model = space.to_model(theta)
-    assert set(model) == {"a", "b", "c", "d"}
+    assert set(model) == {"a", "log10_b", "b", "c", "d"}
     np.testing.assert_allclose(model["b"], [100.0, 0.1])
     np.testing.assert_allclose(model["c"], [2.0, 2.0])
 
@@ -122,8 +97,13 @@ def test_gaussian_ball_needs_a_single_centre(space):
         space.gaussian_ball(4, np.random.default_rng(), center=np.zeros((4, 3)))
 
 
+def _double(x):
+    """Return twice ``x``."""
+    return 2.0 * x
+
+
 def test_a_space_with_nothing_sampled_has_an_empty_prior():
-    space = ParamSpace([Param("a", fixed=1.0), Param("b", tied={"a": 2.0})])
+    space = ParamSpace([Param("a", fixed=1.0), DerivedParam("b", _double, "a")])
     theta = space.sample_prior(5, np.random.default_rng(7))
     assert theta.shape == (5, 0)
     np.testing.assert_array_equal(space.log_prior(theta), np.zeros(5))
@@ -144,9 +124,6 @@ def test_gaussian_ball_redraws_points_outside_a_bounded_prior():
         ({}, "exactly one"),
         ({"prior": (0.0, 1.0), "fixed": 0.5}, "exactly one"),
         ({"prior": (0.0, 1.0), "fiducial": 2.0}, "outside the support"),
-        ({"prior": (0.0, 1.0), "tied": "y"}, "exactly one"),
-        ({"tied": "y", "transform": "pow10"}, "no transform"),
-        ({"tied": "y", "feeds": "v", "index": 0}, "cannot be an element"),
     ],
 )
 def test_invalid_params_raise(kwargs, match):
@@ -158,34 +135,65 @@ def test_invalid_params_raise(kwargs, match):
     ("params", "match"),
     [
         ([Param("x", prior=(0, 1)), Param("x", prior=(0, 2))], "names"),
-        ([Param("x", prior=(0, 1)), Param("y", prior=(0, 1), feeds="x")], "feeds"),
-        ([Param("x", prior=(0, 1)), Param("y", tied="z")], "no parameter feeds"),
-        ([Param("x", tied="y"), Param("y", tied={"x": 2.0})], "cycle"),
+        ([Param("x", prior=(0, 1)), DerivedParam("x", "log", "x")], "names"),
+        (
+            [Param("x", prior=(0, 1)), DerivedParam("y", "identity", "z")],
+            r"derived from \['z'\], which the parameter space does not define",
+        ),
+        (
+            [DerivedParam("x", "identity", "y"), DerivedParam("y", _double, "x")],
+            "cycle",
+        ),
     ],
+    ids=["duplicate", "duplicate_derived", "missing_input", "cycle"],
 )
 def test_inconsistent_param_spaces_raise(params, match):
     with pytest.raises(ValueError, match=match):
         ParamSpace(params)
 
 
+def _make_triple():
+    """Return a new function object, defined in the same place each time."""
+
+    def triple(x):
+        """Return three times ``x``."""
+        return 3.0 * x
+
+    return triple
+
+
 @pytest.mark.parametrize(
-    ("make", "match"),
+    ("make", "error", "match"),
     [
-        (lambda: Param("x", prior=(0.0, 1.0), transform="nope"), "Unknown transform"),
-        (lambda: Tie("nope", ("y",)), "Unknown relation"),
-        (lambda: register_transform("pow10", np.exp, np.log), "already registered"),
-        (lambda: register_relation("linear", np.exp), "already registered"),
+        (lambda: DerivedParam("x", "nope", "y"), ValueError, "Unknown relation"),
+        (
+            lambda: register_relation(np.exp, name="pow10"),
+            ValueError,
+            "already registered",
+        ),
+        (lambda: DerivedParam("x", "stack"), TypeError, "Give the inputs"),
+        (lambda: DerivedParam("x", "pow10", ["a", "b"]), TypeError, "not accept"),
+        (lambda: DerivedParam("x", 3.0, "a"), TypeError, "must be callable"),
     ],
-    ids=[
-        "unknown_transform",
-        "unknown_relation",
-        "transform_exists",
-        "relation_exists",
-    ],
+    ids=["unknown", "name_taken", "inputs_unknown", "wrong_inputs", "not_callable"],
 )
-def test_names_must_be_registered_once(make, match):
-    with pytest.raises(ValueError, match=match):
+def test_invalid_derived_params_raise(make, error, match):
+    with pytest.raises(error, match=match):
         make()
+
+
+def test_registering_the_same_function_again_replaces_it():
+    # As when a notebook cell defining a relation is run twice.
+    first, second = _make_triple(), _make_triple()
+    assert register_relation(first) is first
+    assert register_relation(second) is second
+    x = np.array([1.0, 2.0])
+    np.testing.assert_array_equal(DerivedParam("y", "triple", "x")({"x": x}), 3 * x)
+
+
+def _f_star7_mcg(f_star10, alpha_star):
+    """Return 21cmFAST's default minihalo star-formation normalisation, in log10."""
+    return f_star10 - 3.0 * alpha_star
 
 
 def _astro_params(order):
@@ -193,14 +201,16 @@ def _astro_params(order):
     params = {
         "F_STAR10_ACG": Param("F_STAR10_ACG", prior=(-3.0, 0.0)),
         "ALPHA_STAR_ACG": Param("ALPHA_STAR_ACG", prior=(-0.5, 1.0)),
-        "F_STAR7_MCG": Param(
-            "F_STAR7_MCG", tied={"F_STAR10_ACG": 1.0, "ALPHA_STAR_ACG": -3.0}
+        "F_STAR7_MCG": DerivedParam(
+            "F_STAR7_MCG", _f_star7_mcg, ["F_STAR10_ACG", "ALPHA_STAR_ACG"]
         ),
-        "ALPHA_STAR_MCG": Param("ALPHA_STAR_MCG", tied="ALPHA_STAR_ACG"),
+        "ALPHA_STAR_MCG": DerivedParam("ALPHA_STAR_MCG", "identity", "ALPHA_STAR_ACG"),
         "LX_OVER_SFR_ACG": Param("LX_OVER_SFR_ACG", fixed=40.0),
-        "LX_OVER_SFR_MCG": Param("LX_OVER_SFR_MCG", tied="LX_OVER_SFR_ACG"),
-        # A tie of a tie: resolved after the tie it depends on, whatever the order.
-        "F_STAR7_COPY": Param("F_STAR7_COPY", tied="F_STAR7_MCG"),
+        "LX_OVER_SFR_MCG": DerivedParam(
+            "LX_OVER_SFR_MCG", "identity", "LX_OVER_SFR_ACG"
+        ),
+        # Derived from a derived parameter: computed after it, whatever the order.
+        "F_STAR7_COPY": DerivedParam("F_STAR7_COPY", "identity", "F_STAR7_MCG"),
     }
     return ParamSpace([params[k] for k in order])
 
@@ -221,10 +231,10 @@ ORDERS = {
 
 
 @pytest.mark.parametrize("order", ORDERS.values(), ids=ORDERS.keys())
-def test_ties_reproduce_the_dependent_defaults_of_21cmfast(order):
+def test_derived_parameters_reproduce_the_dependent_defaults_of_21cmfast(order):
     space = _astro_params(order)
     assert space.ndim == 2
-    assert len(space.tied) == 4
+    assert len(space.derived) == 4
 
     theta = space.sample_prior(12, np.random.default_rng(4)).reshape(3, 4, 2)
     model = space.to_model(theta)
@@ -236,33 +246,41 @@ def test_ties_reproduce_the_dependent_defaults_of_21cmfast(order):
     np.testing.assert_array_equal(model["F_STAR7_COPY"], model["F_STAR7_MCG"])
 
 
-def test_ties_relate_model_values_not_sampled_values():
-    # 'b' is sampled as log10_b; a parameter tied to 'b' receives 10**log10_b.
-    space = ParamSpace(
-        [
-            Param("log10_b", prior=(-1.0, 1.0), feeds="b", transform="pow10"),
-            Param("c", tied="b"),
-        ]
-    )
-    model = space.to_model(np.array([[0.5], [-0.5]]))
-    np.testing.assert_allclose(model["c"], 10 ** np.array([0.5, -0.5]))
+def test_derived_parameters_do_not_change_the_prior():
+    derived = _astro_params(ORDERS["dependencies_first"])
+    underived = ParamSpace(derived.sampled)
+    theta = derived.sample_prior(20, np.random.default_rng(5))
+    np.testing.assert_array_equal(derived.log_prior(theta), underived.log_prior(theta))
 
 
-def test_tied_parameters_do_not_change_the_prior():
-    tied = _astro_params(ORDERS["dependencies_first"])
-    untied = ParamSpace(tied.sampled)
-    theta = tied.sample_prior(20, np.random.default_rng(5))
-    np.testing.assert_array_equal(tied.log_prior(theta), untied.log_prior(theta))
-
-
-def test_ties_are_immutable_and_hashable():
-    kwargs = {"offset": 1.0, "coefficients": [2.0]}
-    tie = Tie("linear", ("x",), kwargs)
-    kwargs["offset"] = 5.0  # changing the caller's dict leaves the tie unchanged
-    same = Tie("linear", ("x",), {"coefficients": (2.0,), "offset": 1.0})
-    assert tie == same
-    assert hash(tie) == hash(same)
-    np.testing.assert_allclose(tie({"x": np.array([0.25])}), [1.5])
+@pytest.mark.parametrize(
+    ("params", "name", "expected"),
+    [
+        # Uniform in log10 between 2 and 4: log-uniform between 100 and 10^4.
+        (
+            [Param("log10_a", prior=(2.0, 4.0)), DerivedParam("a", "pow10", "log10_a")],
+            "a",
+            stats.loguniform(1e2, 1e4),
+        ),
+        # The distance from the origin of a standard 2D Gaussian is Rayleigh.
+        (
+            [
+                Param("x", prior=priors.normal(0.0, 1.0)),
+                Param("y", prior=priors.normal(0.0, 1.0)),
+                DerivedParam("r", np.hypot, ["x", "y"]),
+            ],
+            "r",
+            stats.rayleigh(),
+        ),
+    ],
+    ids=["log_uniform", "rayleigh"],
+)
+def test_a_derived_parameter_follows_the_pushforward_of_the_prior(
+    params, name, expected
+):
+    space = ParamSpace(params)
+    draws = space.to_model(space.sample_prior(4000, np.random.default_rng(10)))[name]
+    assert stats.kstest(draws, expected.cdf).pvalue > 1e-3
 
 
 @pytest.mark.parametrize("batch", [(), (5,), (2, 3)])
@@ -283,26 +301,21 @@ def test_vector_elements_are_assembled_into_one_model_parameter(batch):
     np.testing.assert_array_equal(model["x"], theta[..., 3])
 
 
-@pytest.mark.parametrize(
-    ("params", "match"),
-    [
-        (
-            [
-                Param("p_0", prior=(0, 1), feeds="p", index=0),
-                Param("p_2", prior=(0, 1), feeds="p", index=2),
-            ],
-            r"indices 0 to 1, each once; got \[0, 2\]",
-        ),
-        (
-            [Param("p", prior=(0, 1)), Param("p_0", prior=(0, 1), feeds="p", index=0)],
-            "both whole and element by element",
-        ),
-    ],
-    ids=["missing_element", "whole_and_elements"],
-)
-def test_inconsistent_vectors_are_rejected(params, match):
-    with pytest.raises(ValueError, match=match):
-        ParamSpace(params)
+def test_a_vector_can_be_sampled_in_log_space():
+    space = ParamSpace(
+        [
+            *param_vector("log10_p", 3, prior=(-2.0, 2.0)),
+            DerivedParam("p", "pow10", "log10_p"),
+        ]
+    )
+    theta = space.sample_prior(7, np.random.default_rng(9))
+    np.testing.assert_allclose(space.to_model(theta)["p"], 10**theta)
+
+
+def test_a_vector_needs_every_element():
+    p0, _, p2, p = param_vector("p", 3, prior=(0.0, 1.0))
+    with pytest.raises(ValueError, match=r"'p' is derived from \['p_1'\]"):
+        ParamSpace([p0, p2, p])
 
 
 @pytest.mark.parametrize(
@@ -329,9 +342,9 @@ COV = np.array([[1.0, 0.8, 0.0], [0.8, 1.0, -0.5], [0.0, -0.5, 2.0]])
 
 def test_a_joint_prior_couples_its_parameters_wherever_they_are_listed():
     mvn = priors.multivariate_normal([1.0, 2.0, 3.0], COV)
-    b0, b1, b2 = param_vector("beta", prior=mvn)
+    b0, b1, b2, beta = param_vector("beta", prior=mvn)
     x = Param("x", prior=priors.normal(0.0, 1.0))
-    space = ParamSpace([b2, x, b0, b1])
+    space = ParamSpace([b2, x, beta, b0, b1])
     np.testing.assert_allclose(space.fiducial, [3.0, 0.0, 1.0, 2.0])
 
     n = 40_000
