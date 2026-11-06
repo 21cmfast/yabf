@@ -8,6 +8,9 @@ on:
       - 'v*'
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   docs:
     name: Build docs
@@ -16,6 +19,7 @@ jobs:
       - uses: actions/checkout@master
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v7
         with:
           python-version-file: .python-version
