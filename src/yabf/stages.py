@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import graphlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from functools import cached_property
 from typing import Any, Protocol, runtime_checkable
 
 import attrs
@@ -212,6 +213,11 @@ class Stage(Protocol):
     parameter values is inconsistent in a way no single :class:`ParamSpec` can express
     (one parameter bounded by another, say). It must be cheap: :func:`resolve` calls it
     on a few points of the parameter space, without computing anything else.
+
+    A stage may also set ``cacheable = True`` to have a :class:`~yabf.pipeline.Pipeline`
+    keep its outputs across evaluations. This suits stages with small outputs, such as
+    observables, and not simulators. A cached output must not refer to the stage's
+    inputs (a NumPy view of an input field, say), or it keeps them alive.
     """
 
     name: str
@@ -275,13 +281,7 @@ class StageGraph:
         Outputs are ``(stage, slot)`` pairs: one for an ordinary requirement, any
         number for an :class:`All` requirement.
         """
-        inputs: dict[str, tuple[tuple[str, str], ...]] = dict.fromkeys(
-            self._stage(name).requires, ()
-        )
-        for link in self.links:
-            if link.stage == name:
-                inputs[link.slot] += ((link.provider, link.provided),)
-        return inputs
+        return dict(self._inputs[name])
 
     def gather(
         self, name: str, outputs: Mapping[tuple[str, str], Any]
@@ -291,17 +291,27 @@ class StageGraph:
         ``outputs`` maps ``(stage, slot)`` pairs to computed values. An :class:`All`
         requirement receives a tuple of its values.
         """
-        requires = _requires(self._stage(name))
+        requires = self._requirements[name]
         return {
             k: tuple(outputs[src] for src in srcs)
             if isinstance(requires[k], All)
             else outputs[srcs[0]]
-            for k, srcs in self.inputs_of(name).items()
+            for k, srcs in self._inputs[name].items()
         }
 
-    def _stage(self, name: str) -> Stage:
-        """Return the stage called ``name``."""
-        return next(s for s in self.stages if s.name == name)
+    # Lookups computed once per graph: a pipeline uses them on every evaluation.
+    @cached_property
+    def _requirements(self) -> dict[str, dict[str, Slot | All]]:
+        """The requirements of each stage, by stage name."""
+        return {s.name: _requires(s) for s in self.stages}
+
+    @cached_property
+    def _inputs(self) -> dict[str, dict[str, tuple[tuple[str, str], ...]]]:
+        """The outputs feeding each required slot, by stage name and slot name."""
+        inputs = {s.name: dict.fromkeys(s.requires, ()) for s in self.stages}
+        for link in self.links:
+            inputs[link.stage][link.slot] += ((link.provider, link.provided),)
+        return inputs
 
 
 def _describe_param(p: Param) -> str:
