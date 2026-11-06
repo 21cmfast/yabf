@@ -34,7 +34,13 @@ import numpy as np
 from getdist import MCSamples, plots
 
 from yabf import priors
-from yabf.params import Param, ParamSpace, param_vector
+from yabf.params import (
+    DerivedParam,
+    Param,
+    ParamSpace,
+    param_vector,
+    register_relation,
+)
 
 rng = np.random.default_rng(42)
 getdist.chains.print_load_details = False
@@ -79,36 +85,32 @@ ax.set_ylabel("prior density")
 ax.legend();
 ```
 
-## Sampling in a different space: using parameter transforms
+## Sampling in a different space: derived parameters
 
 The foreground of the sky spectrum is a power law whose amplitude we only know to an
 order of magnitude. Instead of sampling the amplitude directly, it is more natural to
-sample in log-space. To achieve this in `yabf`, the simplest way is to specify the
-`feeds` and `transform` options to `Param`. Setting `transform` to `pow10` tells
-`yabf` to raise 10 to the power of the sampled (log-space) parameter, and `feeds` tells
-it the name of the transformed parameter, which in this case is going to match the
-input parameter name for our model, `fg_amp`:
+sample its logarithm. To do this in `yabf`, define two parameters. The first is the
+logarithm, a `Param` with a prior, which the sampler explores. The second is the
+amplitude itself, a {class}`~yabf.params.DerivedParam`, which `yabf` computes from the
+first. It takes the name of the derived parameter, which here matches the model
+parameter `fg_amp`, the function computing it, and the names of its inputs:
 
 ```{code-cell} python
-log_amp = Param(
-    "log10_fg_amp",
-    prior=(2.0, 4.0),
-    feeds="fg_amp",
-    transform="pow10",
-    latex=r"\log_{10} A_{\rm fg}",
-)
-log_amp.to_model(3.0)
+log_amp = Param("log10_fg_amp", prior=(2.0, 4.0), latex=r"\log_{10} A_{\rm fg}")
+amp = DerivedParam("fg_amp", "pow10", "log10_fg_amp", latex=r"A_{\rm fg}")
+amp({"log10_fg_amp": 3.0})
 ```
 
-The sampler now explores `log10_fg_amp`, uniformly between 2 and 4, and `to_model`
-shows the value the model receives: a sampled value of 3 becomes an amplitude of 1000.
+The sampler explores `log10_fg_amp`, uniformly between 2 and 4, and the model receives
+`fg_amp`: a sampled value of 3 becomes an amplitude of 1000.
 
-The built-in transforms are `identity`, `pow10`, `log10`, `exp` and `log`. You can
-define your own with {func}`~yabf.params.register_transform`, giving it a name, the
-function and its inverse. Transforms are referred to by their string name, which means
-they can be used in static configuration files, as long as they are registered.
+The function can be any vectorised Python function, or the name of a registered one.
+The functions `identity`, `pow10`, `log10`, `exp`, `log` and `stack` are registered
+already. Referring to a function by its name means it can be used in a static
+configuration file. You can register your own with the
+{func}`~yabf.params.register_relation` decorator, as the next sections show.
 
-## Fixed and tied parameters
+## Fixed parameters
 
 Not every model parameter needs to be explored. Sometimes you want to hold one at a
 known value: the spectral index of the foreground, say, if it is already well
@@ -121,31 +123,43 @@ index = Param("fg_index", fixed=-2.5)
 
 The sampler never sees a fixed parameter, but the model still receives its value.
 
-Other parameters are not free at all, but follow from the values of others. 21cmFAST,
+## Parameters derived from several others
+
+Some parameters are not free at all, but follow from the values of others. 21cmFAST,
 for instance, describes star formation in minihaloes with parameters that, by default,
-follow those of atomic-cooling haloes. To express this, *tie* the parameter to the
-others with the `tied=` option. A dictionary of coefficients ties it to a linear
-combination of other parameters, and a single name ties it to that parameter's value:
+follow those of atomic-cooling haloes. To express this, derive them from the
+parameters they follow. A derived parameter can have several inputs: write a function
+that takes them, in order, and returns the derived value:
 
 ```{code-cell} python
 f_star10 = Param("F_STAR10", prior=(-3.0, -0.5), latex=r"\log_{10} f_{*,10}")
 alpha_star = Param("ALPHA_STAR", prior=priors.normal(0.5, 0.1), latex=r"\alpha_*")
-f_star7 = Param("F_STAR7_MINI", tied={"F_STAR10": 1, "ALPHA_STAR": -3})
-alpha_mini = Param("ALPHA_STAR_MINI", tied="ALPHA_STAR")
+
+
+@register_relation
+def f_star7_mini(f_star10, alpha_star):
+    """Return log10 of the minihalo star formation normalisation."""
+    return f_star10 - 3 * alpha_star
+
+
+f_star7 = DerivedParam("F_STAR7_MINI", f_star7_mini, ["F_STAR10", "ALPHA_STAR"])
+alpha_mini = DerivedParam("ALPHA_STAR_MINI", "identity", "ALPHA_STAR")
 ```
 
 Here `F_STAR7_MINI = F_STAR10 - 3 ALPHA_STAR`, and `ALPHA_STAR_MINI = ALPHA_STAR`.
-Like fixed parameters, tied ones are not sampled. Other relations can be added with
-{func}`~yabf.params.register_relation`.
+Registering `f_star7_mini` is optional: it lets a configuration file refer to the
+function by its name. When the arguments of the function have the same names as its
+inputs, you can leave the inputs out, and `yabf` takes them from the function. A
+derived parameter can also be derived from other derived parameters.
 
 ## Vector parameters
 
 Some models take a whole vector of parameters, such as the coefficients of a
 polynomial. Rather than writing a `Param` for each element, use
 {func}`~yabf.params.param_vector`. It makes one parameter per element, which the
-sampler sees as separate scalars, and the model receives as one array. As for single
-parameters, elements can be fixed. Here is a vector of three coefficients, with the
-last one held at zero:
+sampler sees as separate scalars, and one derived parameter for the vector, which
+stacks them into the array the model receives. As for single parameters, elements can
+be fixed. Here is a vector of three coefficients, with the last one held at zero:
 
 ```{code-cell} python
 beta = param_vector(
@@ -188,17 +202,17 @@ A whole vector can take a joint prior too, with `param_vector(..., prior=measure
 Once each parameter is defined, collect them all in a
 {class}`~yabf.params.ParamSpace`. This is the object that the rest of `yabf`, and the
 samplers, work with. When you build it, it checks that the parameters are consistent:
-that ties refer to parameters it contains, without cycles, and that each vector is
-complete. It also puts the sampled parameters in a fixed order:
+that derived parameters are computed from parameters it contains, without cycles. It
+also puts the sampled parameters in a fixed order:
 
 ```{code-cell} python
 space = ParamSpace(
-    [log_amp, index, f_star10, alpha_star, f_star7, alpha_mini, *beta, *trough]
+    [log_amp, amp, index, f_star10, alpha_star, f_star7, alpha_mini, *beta, *trough]
 )
 space.names
 ```
 
-Of the eleven parameters, seven are sampled: the fixed and tied ones are not, and
+Of the thirteen parameters, seven are sampled: the fixed and derived ones are not, and
 neither is the fixed element of `beta`.
 
 The parameter space provides what samplers need, for one point or many at once: the
@@ -213,9 +227,10 @@ theta = space.prior_transform(u)
 space.log_prior(theta)
 ```
 
-The last step is to turn the sampled values into the model parameters, which is what
-`to_model` does. It applies the transforms, inserts the fixed values, assembles the
-vectors and computes the tied parameters:
+The last step is to turn the sampled values into the values the model receives, which
+is what `to_model` does. It inserts the fixed values and computes the derived
+parameters, each after those it depends on. It returns every parameter by name, and
+each part of the model takes the ones it needs:
 
 ```{code-cell} python
 model = space.to_model(theta[0])
@@ -238,12 +253,32 @@ g = plots.get_subplot_plotter()
 g.triangle_plot(samples, ["log10_fg_amp", "beta_0", "centre", "width"], filled=True)
 ```
 
-And the tied parameter follows its relation at every draw:
+A derived parameter has no prior of its own: its prior follows from the priors of the
+parameters it is derived from. This is worth checking before you sample. The amplitude
+is uniform in its logarithm, so its density is proportional to $1/A$, and most of the
+prior is at small amplitudes:
 
 ```{code-cell} python
-values = space.to_model(draws[:2000])
+values = space.to_model(draws)
+edges = np.logspace(2, 4, 41)
 fig, ax = plt.subplots(figsize=(4.5, 3.5))
-ax.scatter(values["F_STAR10"] - 3 * values["ALPHA_STAR"], values["F_STAR7_MINI"], s=2)
+ax.hist(values["fg_amp"], bins=edges, density=True, alpha=0.5, label="prior draws")
+ax.plot(edges, 1 / (edges * np.log(100)), label=r"$1 / (A \ln 100)$")
+ax.set_xscale("log")
+ax.set_xlabel(r"$A_{\rm fg}$")
+ax.set_ylabel("prior density")
+ax.legend();
+```
+
+And the minihalo parameter follows its relation at every draw:
+
+```{code-cell} python
+fig, ax = plt.subplots(figsize=(4.5, 3.5))
+ax.scatter(
+    values["F_STAR10"][:2000] - 3 * values["ALPHA_STAR"][:2000],
+    values["F_STAR7_MINI"][:2000],
+    s=2,
+)
 ax.set_xlabel(r"$\log_{10} f_{*,10} - 3\alpha_*$")
 ax.set_ylabel(r"$\log_{10} f_{*,7}^{\rm mini}$");
 ```
