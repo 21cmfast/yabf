@@ -51,6 +51,8 @@ samplers = [
     "h5py>=3.10",
     "nautilus-sampler>=1.0.6",
 ]
+# Samples.to_arviz.
+arviz = ["arviz-base>=1.3"]
 
 [dependency-groups]
 docs = [
@@ -59,11 +61,13 @@ docs = [
     "ipykernel>=6.29",
     "myst-nb>=1.3",
     "numpydoc>=1.10.0",
-    # The tutorials run the samplers.
+    # The tutorials run the samplers, and check them with ArviZ.
+    "arviz>=1.3",
     "h5py>=3.10",
     "nautilus-sampler>=1.0.6",
 ]
 tests = [
+  "arviz>=1.3",
   "h5py>=3.10",
   "nautilus-sampler>=1.0.6",
   "coverage>=7.13.5",
