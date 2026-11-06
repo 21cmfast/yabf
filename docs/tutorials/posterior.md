@@ -228,8 +228,9 @@ print("autocorrelation times:", sampler.get_autocorr_time(quiet=True).round())
 chain = sampler.get_chain(discard=1000, thin=25, flat=True)
 ```
 
-The walkers start near the truth only to keep this tutorial short; a real analysis
-starts them anywhere in the prior, and runs until the chains converge.
+Starting the walkers near the truth makes them converge quickly. With real data the
+truth is unknown: start them across the prior, for example with
+`post.params.sample_prior`, and run until the chains have converged.
 
 The posterior covers the true values, marked by the dotted lines:
 

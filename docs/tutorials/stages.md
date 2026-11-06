@@ -264,7 +264,7 @@ slow = Pipeline.build(stages, space).batch(batch, len(theta))
 fast = Pipeline.build([Gain(), Sky(), BatchedForeground(), Trough()], space).batch(
     batch, len(theta)
 )
-np.allclose(
+assert np.allclose(
     [s.values for s in slow["gain", "observed"]],
     [s.values for s in fast["gain", "observed"]],
 )
