@@ -6,16 +6,21 @@ kernelspec:
 
 # Stages and the pipeline
 
-A model in yabf is a graph of *stages*. Each stage is one pure computation: it
-declares the model parameters it takes, the inputs it requires and the outputs it
-provides, and its `compute` method turns the first two into the third. Every output
-has a name and a type, and an input asks for an output by its name and type, never by
-the stage that makes it. So stages can be swapped, added and reused without changing
-the others.
-
 In this tutorial we build a model of the sky-averaged radio spectrum between 50 and
 100 MHz: a bright foreground, a faint absorption trough from the 21-cm line, and an
-instrument that measures their sum.
+instrument that measures their sum. Along the way, we see how `yabf` splits a model
+into pieces, connects them, and runs them efficiently.
+
+A model in `yabf` is a graph of *stages*. Each stage is one pure computation, which
+declares three things: the model parameters it takes, the inputs it requires from
+other stages, and the outputs it provides. Its `compute` method then turns the first
+two into the third. Every output has a name and a type, and an input asks for an
+output by its name and type, never by the stage that makes it. This means that stages
+can be swapped, added and reused without changing the others.
+
+We start with a few imports, the grid of frequencies, and a small class to hold a
+spectrum. Stages can pass any Python object between them; giving each kind of value
+its own type lets `yabf` check that each input receives what it expects.
 
 ```{code-cell} python
 from collections.abc import Mapping
@@ -41,11 +46,15 @@ class Spectrum:
 
 ## A first stage
 
-The foreground is a power law in frequency. Its stage takes two `parameters`, each
-described by a {class}`~yabf.stages.ParamSpec`: a default value, the values the stage
-accepts (its *domain*) and what the parameter means. It requires no inputs, and
-provides one output: a `Spectrum` named `"component"`, since it is one component of
-the sky.
+Our first stage computes the foreground, a power law in frequency. To write it, we
+declare what it needs and what it makes:
+
+- its `parameters`: the amplitude and the spectral index of the power law. Each is
+  described by a {class}`~yabf.stages.ParamSpec`, which gives a default value, the
+  values the stage accepts (its *domain*) and what the parameter means;
+- its `requires`: nothing, since it is computed from its parameters alone;
+- its `provides`: one output, a `Spectrum` named `"component"`, since it is one
+  component of the sky.
 
 ```{code-cell} python
 @attrs.frozen
@@ -67,10 +76,13 @@ class Foreground:
         }
 ```
 
-Any object with these attributes is a stage; frozen [attrs](https://www.attrs.org)
-classes make it easy to give stages settings of their own, and keep them immutable.
-`compute` receives the parameters' values in its first argument, and returns a
-dictionary of the outputs, by name. A stage can be called on its own:
+Any object with these attributes is a stage. We use frozen
+[attrs](https://www.attrs.org) classes, which make it easy to give stages settings of
+their own, and keep them immutable. `compute` receives the values of the parameters in
+its first argument, and returns a dictionary of the outputs, by name.
+
+To check that the stage does what we expect, we can call it on its own, without the
+rest of the model:
 
 ```{code-cell} python
 Foreground().compute({"fg_amp": 1000.0, "fg_index": -2.5})["component"].values[:3]
@@ -78,10 +90,11 @@ Foreground().compute({"fg_amp": 1000.0, "fg_index": -2.5})["component"].values[:
 
 ## More stages
 
-The 21-cm absorption trough is a Gaussian in frequency. In a real analysis this
-stage would run a simulation, which is slow, so it records each time it runs, and
-declares `cacheable = True`: the pipeline may then reuse its output when its
-parameters have not changed.
+Next, we need the 21-cm absorption trough, which we model as a Gaussian in frequency.
+In a real analysis this stage would run a simulation, which is slow. So that we can
+see later when it runs, it records each run in a list. It also declares
+`cacheable = True`, which allows the pipeline to reuse its output when its parameters
+have not changed. Like the foreground, it provides a `Spectrum` named `"component"`.
 
 ```{code-cell} python
 @attrs.frozen
@@ -106,9 +119,10 @@ class Trough:
         return {"component": Spectrum(-params["depth"] * np.exp(-0.5 * x**2))}
 ```
 
-The sky is the sum of every component. Rather than naming the foreground and signal
-stages, it requires {class}`~yabf.stages.All` the spectra named `"component"`, so a
-third component would be added without changing it. It receives them, as a tuple, in
+We now want to add the components up into the sky spectrum. We could write a stage
+that requires the foreground and the trough by name, but then adding a third component
+would mean changing it. Instead, the stage requires {class}`~yabf.stages.All` the
+spectra named `"component"`, however many there are. It receives them, as a tuple, in
 its argument `components`, and provides a `Spectrum` named `"sky"`:
 
 ```{code-cell} python
@@ -128,9 +142,10 @@ class Sum:
         return {"sky": Spectrum(sum(c.values for c in components))}
 ```
 
-Finally, the instrument multiplies the sky by a gain that is known only roughly. It
-requires the `Spectrum` named `"sky"`, which it receives in its argument `sky`, and
-provides a `Spectrum` named `"observed"`:
+Finally, we model the instrument, which multiplies the sky by a gain that is known
+only roughly. Its stage takes the gain as a parameter, requires the `Spectrum` named
+`"sky"`, which it receives in its argument `sky`, and provides a `Spectrum` named
+`"observed"`:
 
 ```{code-cell} python
 @attrs.frozen
@@ -151,10 +166,13 @@ class Gain:
 
 ## Resolving the graph
 
-{func}`~yabf.stages.resolve` links each input to the outputs that match it, and checks
-the parameters against what each stage accepts. Stages may be given in any order;
-printing the graph shows them in the order they run, with what each takes, where it
-comes from, and what it provides:
+We now have four stages, and need to connect them into a model. This is what
+{func}`~yabf.stages.resolve` does: it links each input to the outputs that match it,
+works out an order in which the stages can run, and checks the parameters against
+what each stage accepts. We can give it the stages in any order, along with the
+parameter space we want to use (built as in the previous tutorial). Printing the
+resulting graph shows the stages in the order they run, with what each takes, where
+it comes from, and what it provides:
 
 ```{code-cell} python
 signal = Trough()
@@ -176,9 +194,11 @@ print(graph)
 An output is written `stage.name`: `signal.component` is the output named
 `"component"` of the stage named `"signal"`.
 
-Problems are found before anything is computed, and all of them are reported at once.
-Here a prior lets the width of the trough become negative, which the stage does not
-accept, and without the sum nothing provides the instrument's input:
+Mistakes in a model are best found before anything slow is computed. So `resolve`
+checks the whole graph first, and reports every problem at once. To see this, we make
+two mistakes on purpose: a prior that lets the width of the trough become negative,
+which the stage does not accept, and a model without the sum, so that nothing provides
+the instrument's input:
 
 ```{code-cell} python
 broken = ParamSpace([Param("width", prior=(-1.0, 10.0))])
@@ -190,8 +210,10 @@ except GraphError as e:
 
 ### Asking for inputs
 
-A bare type asks for the output named like the input, as `Gain` does. Two more
-requirements cover the other cases. {class}`~yabf.stages.One` asks for the only output
+So far, each input has asked for its output in one of two ways: by its name, as `Gain`
+asks for `"sky"`, or by collecting every output of a name, as the sum does. A bare type
+asks for the output named like the input. Two more requirements cover the other
+cases. {class}`~yabf.stages.One` asks for the only output
 of a type, whatever its name, or for an output of another name; {class}`~yabf.stages.All`
 collects every output that matches, of a type and, optionally, some names:
 
@@ -203,8 +225,10 @@ collects every output that matches, of a type and, optionally, some names:
 | `{"components": All(Spectrum, name="component")}` | every `Spectrum` named `"component"` |
 | `{"spectra": All(Spectrum)}` | every `Spectrum` |
 
-`One` is an error unless exactly one output matches. In this graph there are several
-spectra, so a stage asking for "the" spectrum is told which ones it could mean:
+`One(Spectrum)` is convenient when a stage needs an input of some kind, but does not
+care what it is called. It is an error unless exactly one output matches. In our graph
+there are several spectra, so a stage asking for "the" spectrum is told which ones it
+could mean:
 
 ```{code-cell} python
 @attrs.frozen
@@ -231,9 +255,12 @@ except GraphError as e:
 
 ## Running the pipeline
 
-A {class}`~yabf.pipeline.Pipeline` computes the outputs at given values of the model
-parameters. Parameters not given take their defaults. By default it returns the final
-outputs, but any output can be asked for by its `(stage, name)` pair:
+With the graph resolved, we can compute the model. A {class}`~yabf.pipeline.Pipeline`
+runs the stages at given values of the model parameters; any parameter not given takes
+its default. By default it returns the final outputs, those that no other stage uses,
+but we can ask for any output by its `(stage, name)` pair. Here we compute the model at
+the fiducial point, and ask for the two components and the observed spectrum, so that
+we can plot them:
 
 ```{code-cell} python
 pipeline = Pipeline.build(stages, space)
@@ -259,13 +286,20 @@ bottom.legend();
 ```
 
 The observed spectrum is dominated by the foreground: the trough is less than a
-thousandth of it. With a gain of one, subtracting the foreground leaves the signal.
+thousandth of it. With a gain of one, subtracting the foreground leaves the signal,
+which is exactly the difficulty a real measurement faces.
 
 ### Caching
 
-The pipeline has kept the output of the cacheable trough stage. Changing only the
-gain, which is downstream of it, does not run it again; changing its own parameters
-does:
+Samplers evaluate the model many times, often changing only some parameters. When a
+stage is slow, we would like to avoid running it again when its own inputs have not
+changed. This is what `cacheable = True` asks for: the pipeline keeps the outputs of
+the trough stage, and reuses them as long as its parameters and inputs are the same.
+
+To see this, we clear the record of the trough's runs, and evaluate the model twice
+with different gains, then once with a different width. The gain only affects the
+instrument, downstream of the trough, so the trough does not run again until its own
+width changes:
 
 ```{code-cell} python
 signal.runs.clear()
@@ -276,15 +310,20 @@ pipeline({**values, "width": 6.0})
 print(len(signal.runs), "run after changing the width")
 ```
 
-Only stages with small outputs, such as summary statistics, should be cacheable; the
+Only stages with small outputs, such as summary statistics, should be cacheable: the
 cache never holds a simulator's large products.
 
 ### Batches of points
 
-Samplers often propose many points at once. {meth}`~yabf.pipeline.Pipeline.batch`
-evaluates a batch, with each parameter given as an array over the points. A stage
-that can compute the whole batch at once declares `batched = True`, receives arrays,
-and returns one output per point; the others are called once per point.
+Samplers also often propose many points at once, and some stages, such as emulators,
+are much faster when they compute many points together. To take advantage of this,
+{meth}`~yabf.pipeline.Pipeline.batch` evaluates a whole batch, with each parameter
+given as an array over the points. A stage that can compute the whole batch at once
+declares `batched = True`: it then receives arrays, and returns one output per point.
+Stages that do not are simply called once per point.
+
+To try this, we write a batched version of the foreground, and compare the results of
+the two versions on 500 points drawn from the prior:
 
 ```{code-cell} python
 @attrs.frozen
