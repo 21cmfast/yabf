@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import attrs
 import numpy as np
@@ -35,8 +36,12 @@ from getdist import MCSamples
 from numpy.typing import ArrayLike
 from scipy import special
 
+from .params import ParamSpace
 from .pipeline import Output
 from .posterior import Posterior
+
+if TYPE_CHECKING:
+    import xarray
 
 
 def _readonly(value: ArrayLike) -> np.ndarray:
@@ -74,6 +79,9 @@ class Samples:
         estimate.
     log_evidence
         The natural log of the evidence, if the sampler estimates it.
+    n_chains
+        The number of chains the samples come from, all of the same length, one after
+        the other: for emcee, one per walker. Nested samplers give one.
     finished
         Whether the sampler reached its stopping criterion. A run stopped early, by
         a limit on time or on likelihood evaluations, can be resumed from its
@@ -90,6 +98,7 @@ class Samples:
     derived: dict[Output, np.ndarray] = attrs.field(converter=_readonly_mapping)
     n_effective: float
     log_evidence: float | None = None
+    n_chains: int = 1
     finished: bool = True
     sampler: str = ""
 
@@ -111,6 +120,15 @@ class Samples:
                 raise ValueError(f"{what} has {len(value)} entries for {n} samples.")
         if not np.isclose(self.weights.sum(), 1.0):
             raise ValueError("The weights must sum to one.")
+        if self.n_chains < 1 or n % self.n_chains:
+            raise ValueError(
+                f"{n} samples cannot be {self.n_chains} chains of the same length."
+            )
+
+    @property
+    def equally_weighted(self) -> bool:
+        """Whether every sample has the same weight, as for MCMC."""
+        return bool(np.allclose(self.weights, 1 / len(self.weights)))
 
     @property
     def mean(self) -> np.ndarray:
@@ -122,6 +140,98 @@ class Samples:
         """The weighted covariance of the samples."""
         centred = self.points - self.mean
         return (centred.T * self.weights) @ centred
+
+    def resample(self, n: int, rng: np.random.Generator) -> Samples:
+        """Return ``n`` equally weighted samples, drawn by systematic resampling.
+
+        Each sample appears ``floor(n * w)`` or ``ceil(n * w)`` times, for its weight
+        ``w``: the least random way to turn weighted samples into equal ones. Use it
+        for tools that only take equally weighted samples, such as ArviZ, with ``n``
+        about the number of effective samples; the result has no more information
+        than the weighted samples.
+        """
+        positions = (rng.random() + np.arange(n)) / n
+        index = np.minimum(
+            np.searchsorted(np.cumsum(self.weights), positions), len(self.weights) - 1
+        )
+        return attrs.evolve(
+            self,
+            points=self.points[index],
+            weights=np.full(n, 1 / n),
+            log_likelihood=self.log_likelihood[index],
+            log_prior=self.log_prior[index],
+            derived={k: v[index] for k, v in self.derived.items()},
+            n_effective=min(float(n), self.n_effective),
+            n_chains=1,
+        )
+
+    def to_arviz(
+        self,
+        params: ParamSpace | None = None,
+        dims: Mapping[str, list[str]] | None = None,
+        coords: Mapping[str, ArrayLike] | None = None,
+    ) -> xarray.DataTree:
+        """Return the samples as an ArviZ :class:`xarray.DataTree`.
+
+        The ``posterior`` group holds each sampled parameter, each derived output (as
+        ``"stage.output"``) and, if ``params`` is given, each of its derived
+        parameters, with dimensions ``chain`` and ``draw`` first. The
+        ``sample_stats`` group holds the log posterior ``lp``, the log-likelihood and
+        the log prior of each sample. The sampler's name, the number of effective
+        samples and the evidence are attributes of the ``posterior`` group. It needs
+        the ``arviz-base`` package.
+
+        ArviZ takes equally weighted samples only: :meth:`resample` weighted ones
+        first.
+
+        Parameters
+        ----------
+        params
+            The parameter space sampled, to include its derived parameters.
+        dims, coords
+            The names of the dimensions of the variables after ``chain`` and
+            ``draw``, and their coordinates, as for :func:`arviz_base.from_dict`:
+            for example, ``dims={"signal.component": ["freq"]}`` and
+            ``coords={"freq": frequencies}``.
+
+        Raises
+        ------
+        ValueError
+            If the samples are not equally weighted.
+        """
+        from arviz_base import from_dict
+
+        if not self.equally_weighted:
+            raise ValueError(
+                "ArviZ takes equally weighted samples: resample these first, with "
+                "samples.resample(n, rng)."
+            )
+
+        def chains(values: np.ndarray) -> np.ndarray:
+            """Split values along the samples into (chain, draw, ...)."""
+            return values.reshape(self.n_chains, -1, *values.shape[1:])
+
+        posterior = {
+            name: chains(self.points[:, i]) for i, name in enumerate(self.names)
+        }
+        if params is not None:
+            model = params.to_model(self.points)
+            posterior |= {p.name: chains(model[p.name]) for p in params.derived}
+        posterior |= {f"{s}.{o}": chains(v) for (s, o), v in self.derived.items()}
+        stats = {
+            "lp": chains(self.log_likelihood + self.log_prior),
+            "log_likelihood": chains(self.log_likelihood),
+            "log_prior": chains(self.log_prior),
+        }
+        attrs_ = {"sampler": self.sampler, "n_effective": self.n_effective}
+        if self.log_evidence is not None:
+            attrs_["log_evidence"] = self.log_evidence
+        return from_dict(
+            {"posterior": posterior, "sample_stats": stats},
+            dims=dict(dims or {}),
+            coords=dict(coords or {}),
+            attrs={"posterior": attrs_},
+        )
 
     def to_getdist(
         self, labels: list[str] | None = None, **kwargs: object
@@ -177,6 +287,12 @@ def _unpack(
         return {}
     blobs = np.asarray(blobs).reshape(n)
     return {(s, o): blobs[f"{s}.{o}"] for s, o in posterior.derived}
+
+
+def _by_walker(values: np.ndarray) -> np.ndarray:
+    """Flatten emcee's (step, walker, ...) array to one walker's chain after another."""
+    values = np.swapaxes(values, 0, 1)
+    return values.reshape(-1, *values.shape[2:])
 
 
 def _emcee_log_prob(
@@ -262,8 +378,10 @@ def run_emcee(
         sampler.random_state = np.random.RandomState(rng.integers(2**32)).get_state()
         sampler.run_mcmc(start, nsteps, progress=False)
 
-    points = sampler.get_chain(discard=discard, thin=thin, flat=True)
-    log_post = sampler.get_log_prob(discard=discard, thin=thin, flat=True)
+    # Keep each walker's chain together, one walker after another, so that the
+    # chains can be told apart (for ArviZ's R-hat, say).
+    points = _by_walker(sampler.get_chain(discard=discard, thin=thin))
+    log_post = _by_walker(sampler.get_log_prob(discard=discard, thin=thin))
     log_prior = posterior.log_prior(points)
     tau = emcee.autocorr.integrated_time(
         sampler.get_chain(discard=discard), quiet=True
@@ -271,7 +389,7 @@ def run_emcee(
     blobs = (
         None
         if dtype is None
-        else sampler.get_blobs(discard=discard, thin=thin, flat=True)
+        else _by_walker(sampler.get_blobs(discard=discard, thin=thin))
     )
     n = len(points)
     return Samples(
@@ -282,6 +400,7 @@ def run_emcee(
         log_prior=log_prior,
         derived=_unpack(posterior, blobs, n),
         n_effective=n * thin / tau,
+        n_chains=nwalkers,
         sampler="emcee",
     )
 
