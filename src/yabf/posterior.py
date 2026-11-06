@@ -10,15 +10,22 @@ call:
     posterior = Posterior(params=[...], stages=[...], derived=[("sim", "xHI")])
     out = posterior.forward(theta)  # every output of every stage
     lnl, blobs = posterior.log_likelihood(theta)
+    lp, blobs = posterior.log_posterior(theta)
 
 The log-likelihood is the sum of every stage output whose type is
 :class:`LogLikelihood`, and the blobs are the outputs listed in ``derived``. The
 simplest way to add one is a :class:`LikelihoodTerm`, which scores a model output
 against data with a :mod:`~yabf.likelihoods` likelihood, after an optional chain of
 instrument stages of its own; ``posterior.simulate(theta, rng)`` then draws mock data
-from the same likelihoods.
+from the same likelihoods. To analyse a mock, build the posterior without data,
+simulate, and add the mock with :meth:`Posterior.with_data`:
 
-Both methods take one point, ``theta`` of shape ``(ndim,)``, or a batch of points,
+.. code-block:: python
+
+    model = Posterior(params, stages, likelihoods=[LikelihoodTerm("lk", lik, Spectrum)])
+    posterior = model.with_data(model.simulate(truth, rng))
+
+These methods take one point, ``theta`` of shape ``(ndim,)``, or a batch of points,
 of shape ``(n, ndim)``. A batch is evaluated with :meth:`~yabf.pipeline.Pipeline.batch`:
 stages that declare ``batched = True`` see the whole batch at once, and the others
 are called once per point. Both give the same results.
@@ -57,6 +64,21 @@ def _as_param_space(
 def _as_outputs(outputs: Iterable[Sequence[str]]) -> tuple[Output, ...]:
     """Return ``(stage, output)`` pairs as a tuple of tuples."""
     return tuple((stage, output) for stage, output in outputs)
+
+
+def _spread(values: np.ndarray | None, inside: np.ndarray) -> np.ndarray:
+    """Place the values at the points ``inside`` among all the points of a batch.
+
+    The other points get NaN if the values are numeric, and None otherwise.
+    """
+    shape = (len(inside), *(() if values is None else values.shape[1:]))
+    if values is not None and values.dtype.kind in "fc":
+        out = np.full(shape, np.nan, dtype=values.dtype)
+    else:
+        out = np.full(shape, None, dtype=object)
+    if values is not None:
+        out[inside] = values
+    return out
 
 
 def _as_model(model: One | type) -> One:
@@ -100,6 +122,10 @@ class LikelihoodTerm:
     Because the forward stages run inside the term, several terms can apply their own
     instrument effects to one shared model output without competing to provide it.
 
+    The data may be left out, to simulate mock data first: without data, the term
+    still provides the scored model, and its log-likelihood is NaN. Add the data with
+    :meth:`Posterior.with_data`.
+
     Parameters
     ----------
     name
@@ -108,12 +134,13 @@ class LikelihoodTerm:
         The likelihood, from :mod:`yabf.likelihoods` or any with the same interface.
         If it has parameters of its own (``parameters`` and ``with_params``), the term
         takes them and passes them on.
-    data
-        The data, as values or an object with ``values``.
     model
         The model output to score: a type, for the output of that type named
         ``"model"``, or a :class:`~yabf.stages.One`, such as ``One(Spectrum,
         name="sky")``.
+    data
+        The data, as values or an object with ``values``, or None if there are no
+        data yet.
     forward
         Stages applied to the model before scoring, each taking one input that
         accepts the model's type and providing one output of that type (or a
@@ -122,8 +149,8 @@ class LikelihoodTerm:
 
     name: str
     likelihood: Likelihood
-    data: object
     model: One = attrs.field(converter=_as_model)
+    data: object = attrs.field(default=None, kw_only=True)
     forward: tuple[Stage, ...] = attrs.field(
         factory=tuple, converter=tuple, validator=_forward_stage, kw_only=True
     )
@@ -177,6 +204,8 @@ class LikelihoodTerm:
     def compute(self, params: Mapping[str, object], model: object) -> dict:
         """Forward the model, and score the data against it."""
         model = self.forward_model(params, model)
+        if self.data is None:
+            return {"lnl": LogLikelihood(np.nan), "scored": model}
         lnl = self.likelihood_at(params).loglike(model, self.data)
         return {"lnl": LogLikelihood(lnl), "scored": model}
 
@@ -296,6 +325,12 @@ class Posterior:
         point, and each blob an array stacking its values over the points.
         """
         theta = self._check_theta(theta)
+        missing = [t.name for t in self.likelihoods if t.data is None]
+        if missing:
+            raise ValueError(
+                f"The likelihood terms {missing} have no data. Add it with "
+                "with_data, for example from simulate."
+            )
         out = self.forward(theta, self.loglike_outputs + self.derived)
         if theta.ndim == 1:
             return (
@@ -305,6 +340,46 @@ class Posterior:
         terms = [np.asarray(out[k], dtype=float) for k in self.loglike_outputs]
         lnl = np.sum(terms, axis=0)
         return lnl, {d: np.asarray(out[d]) for d in self.derived}
+
+    def log_posterior(
+        self, theta: ArrayLike
+    ) -> tuple[float | np.ndarray, dict[Output, object]]:
+        """Return the log posterior at ``theta``, up to a constant, and the blobs.
+
+        The log posterior is the log prior plus the log-likelihood. Outside the prior
+        it is ``-inf``, and the likelihood is not computed there: the blobs of such a
+        point are None, or NaN for numeric blobs of a batch. For a batch of points,
+        the log posterior and each blob have one value per point, as for
+        :meth:`log_likelihood`.
+        """
+        theta = self._check_theta(theta)
+        lp = np.array(self.log_prior(theta), dtype=float)
+        inside = lp > -np.inf
+        if theta.ndim == 1:
+            if not inside:
+                return -np.inf, dict.fromkeys(self.derived)
+            lnl, blobs = self.log_likelihood(theta)
+            return float(lp) + lnl, blobs
+        blobs = {}
+        if inside.any():
+            lnl, blobs = self.log_likelihood(theta[inside])
+            lp[inside] += lnl
+        return lp, {d: _spread(blobs.get(d), inside) for d in self.derived}
+
+    def with_data(self, data: Mapping[str, object]) -> Posterior:
+        """Return this posterior with new data for its likelihood terms, by name.
+
+        ``data`` maps the names of terms in ``likelihoods`` to their data, as
+        :meth:`simulate` returns them; terms left out keep their data.
+        """
+        unknown = sorted(set(data) - {t.name for t in self.likelihoods})
+        if unknown:
+            raise ValueError(f"The posterior has no likelihood terms named {unknown}.")
+        terms = [
+            attrs.evolve(t, data=data[t.name]) if t.name in data else t
+            for t in self.likelihoods
+        ]
+        return attrs.evolve(self, likelihoods=terms)
 
     def simulate(self, theta: ArrayLike, rng: np.random.Generator) -> dict[str, object]:
         """Draw mock data at one point ``theta``, for each likelihood term, by name.
