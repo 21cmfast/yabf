@@ -49,6 +49,7 @@ yabf = "yabf.cli:main"
 [dependency-groups]
 docs = [
     "Sphinx>=9.1.0",
+    "furo>=2024.8.6",
     "ipykernel>=6.29",
     "myst-nb>=1.3",
     "numpydoc>=1.10.0",

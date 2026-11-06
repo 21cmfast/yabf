@@ -16,8 +16,8 @@ extensions = [
 ]
 master_doc = "index"
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
-pygments_style = "sphinx"
-html_theme = "alabaster"
+html_theme = "furo"
+html_title = "yabf"
 
 # The tutorials are MyST notebooks, run on every build; an error in one fails it.
 nb_execution_mode = "cache"
@@ -31,6 +31,3 @@ intersphinx_mapping = {
     "numpy": ("https://numpy.org/doc/stable", None),
     "scipy": ("https://docs.scipy.org/doc/scipy", None),
 }
-
-# Wide enough for code cells of 88 characters, the line length the code uses.
-html_theme_options = {"page_width": "1200px", "body_max_width": "none"}
