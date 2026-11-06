@@ -45,6 +45,13 @@ Changelog = "https://github.com/steven-murray/yabf/releases"
 [project.scripts]
 yabf = "yabf.cli:main"
 
+[project.optional-dependencies]
+# Samplers and checkpoints for yabf.sampling: nautilus, and HDF5 checkpoints for both.
+samplers = [
+    "h5py>=3.10",
+    "nautilus-sampler>=1.0.6",
+]
+
 [dependency-groups]
 docs = [
     "Sphinx>=9.1.0",
@@ -54,6 +61,8 @@ docs = [
     "numpydoc>=1.10.0",
 ]
 tests = [
+  "h5py>=3.10",
+  "nautilus-sampler>=1.0.6",
   "coverage>=7.13.5",
   "pytest>=9.0.3",
   "pytest-cov>=7.1.0",
