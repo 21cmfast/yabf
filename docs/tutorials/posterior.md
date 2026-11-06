@@ -25,7 +25,7 @@ from getdist import MCSamples, plots
 from yabf.likelihoods import Gaussian
 from yabf.params import Param
 from yabf.posterior import LikelihoodTerm, Posterior
-from yabf.stages import REQUIRED, All, ParamSpec, Slot
+from yabf.stages import REQUIRED, All, One, ParamSpec
 
 rng = np.random.default_rng(2024)
 getdist.chains.print_load_details = False
@@ -52,17 +52,17 @@ class Foreground:
     """A power-law foreground."""
 
     name: str = "foreground"
-    consumes: ClassVar = {
+    parameters: ClassVar = {
         "fg_amp": ParamSpec(1000.0, domain=(0, np.inf)),
         "fg_index": ParamSpec(-2.5),
     }
     requires: ClassVar = {}
-    provides: ClassVar = {"spectrum": Slot(Spectrum, "component")}
+    provides: ClassVar = {"component": Spectrum}
 
     def compute(self, params: Mapping[str, float]) -> dict[str, Spectrum]:
         """The foreground spectrum."""
         return {
-            "spectrum": Spectrum(params["fg_amp"] * (NU / 75) ** params["fg_index"])
+            "component": Spectrum(params["fg_amp"] * (NU / 75) ** params["fg_index"])
         }
 
 
@@ -72,28 +72,28 @@ class Trough:
 
     name: str = "signal"
     runs: list = attrs.field(factory=list, eq=False)
-    consumes: ClassVar = {
+    parameters: ClassVar = {
         "depth": ParamSpec(0.5, domain=(0, np.inf)),
         "centre": ParamSpec(78.0),
         "width": ParamSpec(5.0, domain=(0, np.inf)),
     }
     requires: ClassVar = {}
-    provides: ClassVar = {"spectrum": Slot(Spectrum, "component")}
+    provides: ClassVar = {"component": Spectrum}
 
     def compute(self, params: Mapping[str, float]) -> dict[str, Spectrum]:
         """The trough, recording the run."""
         self.runs.append(1)
         x = (NU - params["centre"]) / params["width"]
-        return {"spectrum": Spectrum(-params["depth"] * np.exp(-0.5 * x**2))}
+        return {"component": Spectrum(-params["depth"] * np.exp(-0.5 * x**2))}
 
 
 @attrs.frozen
-class Sky:
+class Sum:
     """The sum of every component of the sky."""
 
-    name: str = "sky"
-    consumes: ClassVar = {}
-    requires: ClassVar = {"components": All(Spectrum, "component")}
+    name: str = "sum"
+    parameters: ClassVar = {}
+    requires: ClassVar = {"components": All(Spectrum, name="component")}
     provides: ClassVar = {"sky": Spectrum}
 
     def compute(
@@ -108,9 +108,9 @@ class Gain:
     """An instrument with an uncertain gain."""
 
     name: str = "gain"
-    consumes: ClassVar = {"gain": ParamSpec(1.0, domain=(0, np.inf))}
+    parameters: ClassVar = {"gain": ParamSpec(1.0, domain=(0, np.inf))}
     requires: ClassVar = {"sky": Spectrum}
-    provides: ClassVar = {"observed": Slot(Spectrum, "observed")}
+    provides: ClassVar = {"observed": Spectrum}
 
     def compute(
         self, params: Mapping[str, float], sky: Spectrum
@@ -135,9 +135,9 @@ SIGMA = 0.05  # K
 radiometer = Gaussian.from_sigma(np.full(NU.size, SIGMA))
 ```
 
-A {class}`~yabf.posterior.LikelihoodTerm` scores one model output, here the sky
-`Spectrum`, against data with a likelihood. Together with the parameters and stages,
-it makes a posterior:
+A {class}`~yabf.posterior.LikelihoodTerm` scores one model output against data with a
+likelihood. It takes the output to score as a requirement, here the `Spectrum` named
+`"sky"`. Together with the parameters and stages, it makes a posterior:
 
 ```{code-cell} python
 params = [
@@ -147,12 +147,13 @@ params = [
     Param("centre", prior=(60.0, 90.0), latex=r"\nu_0"),
     Param("width", prior=(1.0, 15.0), latex="w"),
 ]
-stages = [Foreground(), Trough(), Sky()]
+stages = [Foreground(), Trough(), Sum()]
+SKY = One(Spectrum, name="sky")
 
 
 def posterior(data: np.ndarray) -> Posterior:
     """The posterior of our parameters, given a measured sky spectrum."""
-    term = LikelihoodTerm("radiometer", radiometer, data, Spectrum)
+    term = LikelihoodTerm("radiometer", radiometer, data, SKY)
     return Posterior(params, stages, likelihoods=[term])
 ```
 
@@ -174,13 +175,13 @@ is subtracted:
 
 ```{code-cell} python
 out = post.forward(truth)
-foreground = out["foreground", "spectrum"].values
+foreground = out["foreground", "component"].values
 
 fig, (top, bottom) = plt.subplots(2, 1, sharex=True, figsize=(6, 5))
 top.plot(NU, mock, ".", ms=3)
 top.set_ylabel("T [K]")
 bottom.errorbar(NU, mock - foreground, SIGMA, fmt=".", ms=3, label="mock - foreground")
-bottom.plot(NU, out["signal", "spectrum"].values, label="true signal")
+bottom.plot(NU, out["signal", "component"].values, label="true signal")
 bottom.set_xlabel(r"$\nu$ [MHz]")
 bottom.set_ylabel("T [K]")
 bottom.legend();
@@ -258,8 +259,8 @@ the data allow:
 ```{code-cell} python
 fig, ax = plt.subplots(figsize=(6, 3.5))
 for theta in chain[rng.choice(len(chain), 100)]:
-    ax.plot(NU, post.forward(theta)["signal", "spectrum"].values, color="C0", alpha=0.1)
-ax.plot(NU, out["signal", "spectrum"].values, "k--", label="truth")
+    ax.plot(NU, post.forward(theta)["signal", "component"].values, color="C0", alpha=0.1)
+ax.plot(NU, out["signal", "component"].values, "k--", label="truth")
 ax.set_xlabel(r"$\nu$ [MHz]")
 ax.set_ylabel("T [K]")
 ax.legend();
@@ -270,7 +271,7 @@ ax.legend();
 A likelihood term can apply instrument effects of its own before scoring the model,
 in its `forward` stages. Two instruments measuring the same sky, one of them with an
 uncertain gain, are two terms scoring one shared sky spectrum. The sky is computed
-once for both, and each term's model is an output of its own:
+once for both, and each term provides the model it scored as its output `"scored"`:
 
 ```{code-cell} python
 second = Gaussian.from_sigma(np.full(NU.size, 2 * SIGMA))
@@ -281,10 +282,10 @@ def two_instruments(data: np.ndarray, second_data: np.ndarray) -> Posterior:
     """The posterior given the spectra measured by both instruments."""
     return Posterior(
         [*params, Param("gain", prior=(0.98, 1.02))],
-        [Foreground(), signal, Sky()],
+        [Foreground(), signal, Sum()],
         likelihoods=[
-            LikelihoodTerm("radiometer", radiometer, data, Spectrum),
-            LikelihoodTerm("second", second, second_data, Spectrum, forward=[Gain()]),
+            LikelihoodTerm("radiometer", radiometer, data, SKY),
+            LikelihoodTerm("second", second, second_data, SKY, forward=[Gain()]),
         ],
     )
 
@@ -297,7 +298,7 @@ two = two_instruments(mocks["radiometer"], mocks["second"])
 signal.runs.clear()
 out = two.forward(theta)
 print(len(signal.runs), "run of the signal")
-out["second", "model"].values[:3] / out["radiometer", "model"].values[:3]
+out["second", "scored"].values[:3] / out["radiometer", "scored"].values[:3]
 ```
 
 The log-likelihood is the sum of the terms:
@@ -309,7 +310,7 @@ two.loglike_outputs, two.log_likelihood(theta)[0]
 ## Likelihoods with parameters of their own
 
 The noise level of a measurement is not always known. A likelihood can have
-parameters of its own: it declares them in `consumes`, like a stage, and `with_params`
+parameters of its own: it declares them in `parameters`, like a stage, and `with_params`
 returns the likelihood at given values. Here the noise of each channel is an unknown
 `noise` in K:
 
@@ -319,7 +320,7 @@ class UnknownNoise:
     """Independent Gaussian noise of unknown amplitude."""
 
     size: int
-    consumes: ClassVar = {"noise": ParamSpec(REQUIRED, domain=(0, np.inf))}
+    parameters: ClassVar = {"noise": ParamSpec(REQUIRED, domain=(0, np.inf))}
 
     def with_params(self, params: Mapping[str, float]) -> Gaussian:
         """The likelihood at the noise level ``params["noise"]``."""
@@ -337,7 +338,7 @@ class UnknownNoise:
 unknown = Posterior(
     [*params, Param("noise", prior=(0.01, 0.2), latex=r"\sigma")],
     stages,
-    likelihoods=[LikelihoodTerm("radiometer", UnknownNoise(NU.size), mock, Spectrum)],
+    likelihoods=[LikelihoodTerm("radiometer", UnknownNoise(NU.size), mock, SKY)],
 )
 unknown.names
 ```
@@ -361,7 +362,7 @@ ax.legend()
 ax.set_xlabel("noise [mK]")
 ax.set_ylabel("likelihood (relative)")
 
-residual = mock - post.forward(truth)["sky", "sky"].values
+residual = mock - post.forward(truth)["sum", "sky"].values
 print(f"peak: {grid[np.argmax(lnl)] * 1e3:.1f} mK")
 print(f"RMS of the residuals: {np.sqrt(np.mean(residual**2)) * 1e3:.1f} mK")
 ```
@@ -377,20 +378,20 @@ the posterior reports how each one is set:
 class NoisyForeground(Foreground):
     """A foreground with a random ripple, as a stand-in for a random simulation."""
 
-    consumes: ClassVar = {**Foreground.consumes, "seed": ParamSpec(0, random=True)}
+    parameters: ClassVar = {**Foreground.parameters, "seed": ParamSpec(0, random=True)}
 
     def compute(self, params: Mapping[str, float]) -> dict[str, Spectrum]:
         """The foreground, with a ripple drawn from the seed."""
         ripple = np.random.default_rng(int(params["seed"])).normal(0, 0.01, NU.size)
         return {
-            "spectrum": Spectrum(super().compute(params)["spectrum"].values + ripple)
+            "component": Spectrum(super().compute(params)["component"].values + ripple)
         }
 
 
 noisy = Posterior(
     params,
-    [NoisyForeground(), Trough(), Sky()],
-    likelihoods=[LikelihoodTerm("radiometer", radiometer, mock, Spectrum)],
+    [NoisyForeground(), Trough(), Sum()],
+    likelihoods=[LikelihoodTerm("radiometer", radiometer, mock, SKY)],
 )
 noisy.random_inputs
 ```
