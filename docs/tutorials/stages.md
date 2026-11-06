@@ -210,12 +210,17 @@ except GraphError as e:
 
 ### Asking for inputs
 
-So far, each input has asked for its output in one of two ways: by its name, as `Gain`
-asks for `"sky"`, or by collecting every output of a name, as the sum does. A bare type
-asks for the output named like the input. Two more requirements cover the other
-cases. {class}`~yabf.stages.One` asks for the only output
-of a type, whatever its name, or for an output of another name; {class}`~yabf.stages.All`
-collects every output that matches, of a type and, optionally, some names:
+So far, we have defined the input requirements in one of two ways: either by
+specifying both the name and the type (for example, `Gain` specifies that it needs a
+`Spectrum` called `"sky"`), or by collecting everything of a given type with a given
+name (for example, `Sum` collects all `Spectrum` objects with the name
+`"component"`).
+
+You can also specify the requirements in some other ways, as defined by the table
+below. You can require an input named one thing, but receive it under another name.
+You can require a particular type with *any* name using {class}`~yabf.stages.One`, or
+you can collect all outputs of a given type, regardless of name, by not giving a name
+to {class}`~yabf.stages.All`:
 
 | `requires = {...}` | receives |
 |---|---|
@@ -286,8 +291,7 @@ bottom.legend();
 ```
 
 The observed spectrum is dominated by the foreground: the trough is less than a
-thousandth of it. With a gain of one, subtracting the foreground leaves the signal,
-which is exactly the difficulty a real measurement faces.
+thousandth of it. With a gain of one, subtracting the foreground leaves the signal.
 
 ### Caching
 
@@ -356,5 +360,36 @@ assert np.allclose(
 Both give the same result, one value per point. Stages that are called point by point
 release each point's outputs before the next point starts, so a batch never holds
 more than one simulation in memory at a time.
+
+### The prior on what the model computes
+
+A batch of points drawn from the prior gives the prior on anything the model
+computes, before we have any data or a posterior. For example, the signal of each of
+our 500 draws shows the range of troughs the prior allows. A batch returns the
+outputs it is asked for, here the signal. Here we plot the median of
+the signal at each frequency, the bands holding 68% and 95% of the draws, and a few
+of the draws themselves:
+
+```{code-cell} python
+prior = Pipeline.build(stages, space).batch(
+    batch, len(theta), want=[("signal", "component")]
+)
+troughs = np.array([s.values for s in prior["signal", "component"]])
+lo95, lo68, median, hi68, hi95 = np.percentile(troughs, [2.5, 16, 50, 84, 97.5], axis=0)
+
+fig, ax = plt.subplots(figsize=(6, 3.5))
+ax.fill_between(NU, lo95, hi95, color="C0", alpha=0.2, label="95%")
+ax.fill_between(NU, lo68, hi68, color="C0", alpha=0.4, label="68%")
+ax.plot(NU, median, color="C0", label="median")
+for t in troughs[:5]:
+    ax.plot(NU, t, color="k", lw=0.5, alpha=0.5)
+ax.set_xlabel(r"$\nu$ [MHz]")
+ax.set_ylabel("T [K]")
+ax.legend();
+```
+
+The prior is broad: it allows troughs from barely there to 2 K deep, anywhere between
+60 and 90 MHz. Near the edges of the band most draws are close to zero, since a
+trough only reaches the frequencies near its centre.
 
 The next tutorial turns this model into a posterior.
