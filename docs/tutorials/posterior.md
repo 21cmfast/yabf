@@ -17,15 +17,15 @@ from collections.abc import Mapping
 from typing import ClassVar
 
 import attrs
-import emcee
 import getdist
 import matplotlib.pyplot as plt
 import numpy as np
-from getdist import MCSamples, plots
+from getdist import plots
 
 from yabf.likelihoods import Gaussian
 from yabf.params import Param
 from yabf.posterior import LikelihoodTerm, Posterior
+from yabf.sampling import run_emcee
 from yabf.stages import REQUIRED, All, One, ParamSpec
 
 rng = np.random.default_rng(2024)
@@ -224,47 +224,36 @@ data very badly, which is why we need a sampler to find the region of good fits.
 
 We now explore the posterior with a sampler. A posterior gives a sampler what it
 needs: `ndim`, `names`, `log_prior`, `prior_transform`, `log_likelihood` and
-`log_posterior`. Here we use [emcee](https://emcee.readthedocs.io), an MCMC sampler.
-It needs one function, the log posterior, which `post.log_posterior` provides. Like
-`log_likelihood`, it also returns the blobs, which emcee can store at each step of
-the chain: we keep the signal, so that we do not have to compute it again later.
-emcee calls the function on all its walkers at once, which `yabf` evaluates as a
-batch, and expects one log posterior and one blob per walker:
+`log_posterior`, each for one point or a batch of them. {mod}`yabf.sampling` drives
+common samplers with these. Here we use {func}`~yabf.sampling.run_emcee`, which runs
+[emcee](https://emcee.readthedocs.io), an MCMC sampler, evaluating all its walkers as
+one batch. It returns {class}`~yabf.sampling.Samples`: the points, with the
+log-likelihood, the log prior and the derived outputs of each. The derived outputs are
+stored as arrays of their values, so the signal at each sample comes with the chain,
+and we do not have to compute it again later:
 
 ```{code-cell} python
-def log_prob(theta: np.ndarray) -> list[tuple[float, Spectrum]]:
-    """The log posterior of each walker, with the signal at its position."""
-    lp, blobs = post.log_posterior(theta)
-    return list(zip(lp, blobs[SIGNAL], strict=True))
-
-
-nwalkers = 32
-start = post.params.gaussian_ball(nwalkers, rng, center=truth)
-sampler = emcee.EnsembleSampler(
-    nwalkers, post.ndim, log_prob, vectorize=True, blobs_dtype=object
-)
-sampler.run_mcmc(start, 4000, progress=False)
-print("autocorrelation times:", sampler.get_autocorr_time(quiet=True).round())
-chain = sampler.get_chain(discard=1000, thin=25, flat=True)
-signals = sampler.get_blobs(discard=1000, thin=25, flat=True)
+start = post.params.gaussian_ball(32, rng, center=truth)
+samples = run_emcee(post, 4000, rng, start=start, discard=1000, thin=25)
+chain, signals = samples.points, samples.derived[SIGNAL]
+print(f"{len(chain)} samples, about {samples.n_effective:.0f} effective")
 ```
 
 Starting the walkers near the truth makes them converge quickly. With real data the
-truth is unknown: start them across the prior, for example with
-`post.params.sample_prior`, and run until the chains have converged.
+truth is unknown: leave out `start`, so that the walkers start across the prior, and
+run until the chains have converged. Giving `run_emcee` a `checkpoint` file writes the
+chain as it runs; calling it again with the same file resumes the run.
 
 To see the result, we plot the samples as a corner plot. The posterior covers the true
 values, marked by the dotted lines:
 
 ```{code-cell} python
-samples = MCSamples(
-    samples=chain,
-    names=post.names,
-    labels=[p.latex for p in post.params.sampled],
-    label="posterior",
-)
 g = plots.get_subplot_plotter()
-g.triangle_plot(samples, filled=True, markers=dict(zip(post.names, truth)))
+g.triangle_plot(
+    samples.to_getdist(labels=[p.latex for p in post.params.sampled], label="posterior"),
+    filled=True,
+    markers=dict(zip(post.names, truth)),
+)
 ```
 
 ```{code-cell} python
@@ -281,8 +270,8 @@ allow:
 
 ```{code-cell} python
 fig, ax = plt.subplots(figsize=(6, 3.5))
-for s in signals[rng.choice(len(signals), 100)]:
-    ax.plot(NU, s.values, color="C0", alpha=0.1)
+for signal in signals[rng.choice(len(signals), 100)]:
+    ax.plot(NU, signal, color="C0", alpha=0.1)
 ax.plot(NU, out["signal", "component"].values, "k--", label="truth")
 ax.set_xlabel(r"$\nu$ [MHz]")
 ax.set_ylabel("T [K]")
