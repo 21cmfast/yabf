@@ -479,11 +479,12 @@ def _link(stages: Sequence[Stage]) -> tuple[list[Link], list[str]]:
             if matches:
                 found = ", ".join(f"{stage}.{name}" for stage, name in matches)
                 kind = need.type.__qualname__
-                fix = (
-                    f"Name the one to use, with One({kind}, name=...)."
-                    if need.name is None
-                    else "Give the outputs distinct names."
-                )
+                if need.name is None:
+                    fix = f"Name the one to use, with One({kind}, name=...)."
+                elif len(need.name) > 1:
+                    fix = "Accept fewer names, so that only one output matches."
+                else:
+                    fix = "Give the outputs distinct names."
                 problems.append(f"{where}, but several outputs match: {found}. {fix}")
                 continue
             same_type = [
@@ -508,11 +509,22 @@ def _declaration_problems(stage: Stage) -> list[str]:
             f"Stage {stage.name!r} must declare `parameters` as a mapping from "
             f"parameter names to ParamSpec, got {stage.parameters!r}."
         )
-    if not all(isinstance(kind, type) for kind in stage.provides.values()):
+    if not isinstance(stage.provides, Mapping) or not all(
+        isinstance(k, str) and isinstance(kind, type)
+        for k, kind in stage.provides.items()
+    ):
         problems.append(
             f"Stage {stage.name!r} must declare `provides` as a mapping from output "
             f"names to types, got {stage.provides!r}."
         )
+    if not isinstance(stage.requires, Mapping) or not all(
+        isinstance(k, str) for k in stage.requires
+    ):
+        problems.append(
+            f"Stage {stage.name!r} must declare `requires` as a mapping from input "
+            f"names, got {stage.requires!r}."
+        )
+        return problems
     for k, req in stage.requires.items():
         try:
             _as_requirement(k, req)
