@@ -202,30 +202,33 @@ def test_a_stage_that_breaks_its_contract_is_reported(returns, match):
 
 
 @pytest.mark.parametrize(
-    ("stages", "need", "provider"),
+    ("stages", "need", "source"),
     [
         # A bare type takes the output of the input's name.
-        ([Simulator(name="sim_a", output_name="a"), Simulator()], Field, "sim"),
+        (
+            [Simulator(name="sim_a", output_name="a"), Simulator()],
+            Field,
+            ("sim", "field"),
+        ),
         # One(type) takes the only output of the type, whatever its name.
-        ([Simulator(output_name="density")], One(Field), "sim"),
+        ([Simulator(output_name="density")], One(Field), ("sim", "density")),
         # One(type, name=...) picks between outputs of the same type.
         (
             [Simulator(name="sim_a", output_name="a"), Simulator(name="sim_b")],
             One(Field, name="a"),
-            "sim_a",
+            ("sim_a", "a"),
         ),
         (
             [Simulator(name="sim_a", output_name="a"), Simulator(output_name="b")],
             One(Field, name=["b", "c"]),
-            "sim",
+            ("sim", "b"),
         ),
     ],
     ids=["by_input_name", "only_of_type", "named", "one_of_names"],
 )
-def test_an_input_takes_the_output_that_matches_its_requirement(stages, need, provider):
+def test_an_input_takes_the_output_that_matches_its_requirement(stages, need, source):
     graph = resolve([*stages, Measure(need=need)])
-    ((source, _),) = graph.inputs_of("measure")["field"]
-    assert source == provider
+    assert graph.inputs_of("measure") == {"field": (source,)}
 
 
 def test_a_subclass_satisfies_a_requirement_for_its_base_type():
@@ -277,11 +280,30 @@ def _problems(stages, params=None):
             ),
         ),
         (
+            [
+                Simulator(name="sim_a", output_name="a"),
+                Simulator(name="sim_b", output_name="b"),
+                Measure(need=One(Field, name=["a", "b"])),
+            ],
+            (
+                "Stage 'measure' requires a Field named 'a' or 'b' (input 'field'), "
+                "but several outputs match: sim_a.a, sim_b.b. Accept fewer names, so "
+                "that only one output matches."
+            ),
+        ),
+        (
             [Simulator(), Simulator(), Measure()],
             "Several stages are named ['sim']; stage names must be unique.",
         ),
     ],
-    ids=["missing", "missing_with_other_name", "ambiguous", "ambiguous_type", "dupes"],
+    ids=[
+        "missing",
+        "missing_with_other_name",
+        "ambiguous",
+        "ambiguous_type",
+        "ambiguous_names",
+        "dupes",
+    ],
 )
 def test_unresolvable_graphs_are_reported_with_readable_messages(stages, expected):
     assert expected in _problems(stages)
@@ -373,10 +395,23 @@ class Declared:
     [
         (Declared(parameters=frozenset({"x"})), "mapping from parameter names to"),
         (Declared(provides={"x": Field(np.zeros(1))}), "output names to types"),
+        (Declared(provides={1: Field}), "output names to types"),
+        (Declared(provides=[Field]), "output names to types"),
         (Declared(requires={"x": "Field"}), "must be a type, One"),
+        (Declared(requires={1: One(Field)}), "mapping from input names"),
+        (Declared(requires=[Field]), "mapping from input names"),
         (Declared(requires={"params": Field}), "'params', which is reserved"),
     ],
-    ids=["parameters", "provides", "requires", "reserved_input_name"],
+    ids=[
+        "parameters",
+        "provides_values",
+        "provides_keys",
+        "provides_not_a_mapping",
+        "requires_values",
+        "requires_keys",
+        "requires_not_a_mapping",
+        "reserved_input_name",
+    ],
 )
 def test_malformed_declarations_are_rejected(stage, match):
     with pytest.raises(TypeError, match=match):
@@ -601,9 +636,12 @@ def test_a_stage_does_not_collect_its_own_outputs():
 @pytest.mark.parametrize(
     ("parts", "expected"),
     [
-        (None, ["fg", "signal", "other"]),
-        (["model", "other"], ["fg", "signal", "other"]),
-        ("other", ["other"]),
+        (None, [("fg", "model"), ("signal", "model"), ("other", "other")]),
+        (
+            ["model", "other"],
+            [("fg", "model"), ("signal", "model"), ("other", "other")],
+        ),
+        ("other", [("other", "other")]),
     ],
     ids=["any_name", "several_names", "one_name"],
 )
@@ -615,7 +653,7 @@ def test_all_collects_the_outputs_of_any_of_its_names(parts, expected):
         PowerLaw("other", output="other"),
     ]
     graph = resolve(stages)
-    assert [p for p, _ in graph.inputs_of("residual")["parts"]] == expected
+    assert list(graph.inputs_of("residual")["parts"]) == expected
 
 
 @pytest.mark.parametrize(
@@ -673,8 +711,9 @@ class Polynomial:
 
 def test_a_vector_of_elements_feeds_a_vector_parameter():
     params = ParamSpace(param_vector("p", 4, prior=(-10.0, 10.0), fixed={1: 0.0}))
-    out = _run(resolve([Polynomial()], params), params.to_model(params.fiducial))
-    expected = np.polyval([0.0, 0.0, 0.0, 0.0], FREQS / 75)
+    theta = np.array([1.0, -2.0, 3.0])  # the sampled elements p_0, p_2, p_3
+    out = _run(resolve([Polynomial()], params), params.to_model(theta))
+    expected = np.polyval([3.0, -2.0, 0.0, 1.0], FREQS / 75)
     np.testing.assert_allclose(out["poly", "model"].values, expected)
 
 
