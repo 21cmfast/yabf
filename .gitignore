@@ -25,3 +25,6 @@ dist/
 build/
 coverage.xml
 .qodo
+
+# Documentation builds
+docs/_build/
