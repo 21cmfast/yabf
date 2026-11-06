@@ -40,7 +40,7 @@ import attrs
 import numpy as np
 from numpy.typing import ArrayLike
 
-from .params import Param, ParamSpace
+from .params import ParamSpace
 
 
 class _Required:
@@ -69,7 +69,9 @@ def _fmt(value: ArrayLike) -> str:
     """Format a scalar or array value briefly, for error messages."""
     if np.ndim(value) == 0:
         return f"{float(value):g}"
-    return np.array2string(np.asarray(value), precision=4)
+    return np.array2string(
+        np.asarray(value, dtype=float), formatter={"float_kind": lambda x: f"{x:g}"}
+    )
 
 
 @attrs.frozen
@@ -115,10 +117,6 @@ class ParamSpec:
         """Say why the stage does not accept ``value``, or return None if it does."""
         if np.shape(value) != self.shape:
             return f"has shape {np.shape(value)}, not {self.shape}"
-        return self._outside_domain(value)
-
-    def _outside_domain(self, value: ArrayLike) -> str | None:
-        """Say how ``value`` falls outside the domain, or return None if it doesn't."""
         if self.domain is not None:
             low, high = self.domain
             v = np.asarray(value, dtype=float)
@@ -358,26 +356,32 @@ class StageGraph:
         return inputs
 
 
-def _describe_param(p: Param) -> str:
-    """Name a parameter, and the model parameter it feeds if that differs."""
-    return repr(p.name) if p.name == p.feeds else f"{p.name!r} (feeds {p.feeds!r})"
-
-
 def _unused_params(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
-    """Return the parameters that reach no stage, directly or through a tie."""
+    """Return the parameters that reach no stage, directly or through a derived one.
+
+    Only the last parameter of each unused chain is named: if a sampled ``log10_x``
+    derives ``x`` and no stage takes ``x``, only ``x`` is.
+    """
     taken = set().union(*(s.parameters for s in stages))
-    by_feeds = {p.feeds: p for p in params.params}
-    used = set()
-    todo = [f for f in by_feeds if f in taken]
-    while todo:
-        feeds = todo.pop()
-        if feeds in used:
-            continue
-        used.add(feeds)
-        tie = by_feeds[feeds].tied
-        if tie is not None:
-            todo.extend(tie.inputs)
-    return [_describe_param(p) for p in params.params if p.feeds not in used]
+    used = set().union(*(params.upstream(n) for n in taken if n in params))
+    inputs = {i for p in params.derived for i in p.inputs}
+    skip = used | inputs
+    return [repr(p.name) for p in params.params if p.name not in skip]
+
+
+def _edges(params: ParamSpace) -> Iterator[tuple[str, str | None, np.ndarray]]:
+    """Yield the points to check exactly, with a label and the parameter moved.
+
+    The points are the fiducial point, where no parameter is moved, and each sampled
+    parameter at both edges of its prior, with the others at their fiducial values.
+    """
+    fiducial = params.fiducial
+    yield "at the fiducial point", None, fiducial
+    for i, p in enumerate(params.sampled):
+        for side, q in (("lower", 0.0), ("upper", 1.0)):
+            theta = fiducial.copy()
+            theta[i] = p.prior.ppf(q)
+            yield f"at the {side} edge of the prior of {p.name!r}", p.name, theta
 
 
 def _probes(params: ParamSpace) -> Iterator[tuple[str, np.ndarray]]:
@@ -400,32 +404,37 @@ def _probes(params: ParamSpace) -> Iterator[tuple[str, np.ndarray]]:
 def _param_problems(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
     """Check the parameter space against what each stage accepts, computing nothing."""
     found: dict[tuple[str, str], str] = {}  # the first problem per stage and parameter
-    by_feeds: dict[str, list] = {}  # several parameters feed a vector's elements
-    for p in params.params:
-        by_feeds.setdefault(p.feeds, []).append(p)
     for s in stages:
         for name, spec in s.parameters.items():
-            if name not in by_feeds and spec.required:
+            if name not in params and spec.required:
                 found[s.name, name] = (
                     f"Stage {s.name!r} requires the parameter {name!r}, which the "
                     "parameter space does not define."
                 )
-            # For a monotonic transform (every built-in one), the support of a prior
-            # maps onto the interval between the model values at its edges. Other
-            # transforms are only checked at the points from _probes below. An
-            # element of a vector is checked against the domain only; the vector's
-            # shape is checked at those points.
-            for p in by_feeds.get(name, []):
-                if not p.is_sampled:
+
+    # The fiducial point, then each sampled parameter at the very edges of its prior
+    # with the others at their fiducial values. For a monotonic function of one
+    # sampled parameter (every built-in one), the support of the prior maps onto the
+    # interval between the values at its edges, so this check is exact. Other
+    # functions are also checked at the points from _probes below, and so is a value
+    # that is undefined (NaN) at an infinite edge.
+    for where, moved, theta in _edges(params):
+        with np.errstate(all="ignore"):
+            values = params.to_model(theta)
+        for s in stages:
+            for name, spec in s.parameters.items():
+                if (
+                    (s.name, name) in found
+                    or name not in params
+                    or (moved is not None and moved not in params.upstream(name))
+                    or np.any(np.isnan(values[name]))
+                ):
                     continue
-                check = spec.why_not if p.index is None else spec._outside_domain
-                for side, q in (("lower", 0.0), ("upper", 1.0)):
-                    value = p.to_model(p.prior.ppf(q))
-                    if (s.name, name) not in found and (why := check(value)):
-                        found[s.name, name] = (
-                            f"Stage {s.name!r} rejects {name!r} at the {side} edge of "
-                            f"the prior of {p.name!r}: the value {_fmt(value)} {why}."
-                        )
+                if why := spec.why_not(values[name]):
+                    found[s.name, name] = (
+                        f"Stage {s.name!r} rejects {name!r} {where}: the value "
+                        f"{_fmt(values[name])} {why}."
+                    )
 
     for where, theta in _probes(params):
         values = params.to_model(theta)

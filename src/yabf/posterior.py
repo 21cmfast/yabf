@@ -28,7 +28,7 @@ import attrs
 import numpy as np
 from numpy.typing import ArrayLike
 
-from .params import Param, ParamSpace
+from .params import DerivedParam, Param, ParamSpace
 from .pipeline import Output, Pipeline
 from .stages import Stage
 
@@ -41,7 +41,9 @@ class LogLikelihood(float):
     """
 
 
-def _as_param_space(params: ParamSpace | Iterable[Param]) -> ParamSpace:
+def _as_param_space(
+    params: ParamSpace | Iterable[Param | DerivedParam],
+) -> ParamSpace:
     """Return ``params`` as a :class:`~yabf.params.ParamSpace`."""
     return params if isinstance(params, ParamSpace) else ParamSpace(params)
 
@@ -59,7 +61,7 @@ class Posterior:
     ----------
     params
         The parameters, as a :class:`~yabf.params.ParamSpace` or a sequence of
-        :class:`~yabf.params.Param`.
+        :class:`~yabf.params.Param` and :class:`~yabf.params.DerivedParam`.
     stages
         The stages of the forward model. At least one must provide a
         :class:`LogLikelihood` output. They are resolved, and checked against
