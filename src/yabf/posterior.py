@@ -11,7 +11,7 @@ call:
     out = posterior.forward(theta)  # every output of every stage
     lnl, blobs = posterior.log_likelihood(theta)
 
-The log-likelihood is the sum of every stage output whose slot type is
+The log-likelihood is the sum of every stage output whose type is
 :class:`LogLikelihood`, and the blobs are the outputs listed in ``derived``.
 
 Both methods take one point, ``theta`` of shape ``(ndim,)``, or a batch of points,
@@ -30,13 +30,13 @@ from numpy.typing import ArrayLike
 
 from .params import Param, ParamSpace
 from .pipeline import Output, Pipeline
-from .stages import Stage, as_slot
+from .stages import Stage
 
 
 class LogLikelihood(float):
     """A log-likelihood term, as a stage output.
 
-    A stage that provides a slot of this type contributes that output to the
+    A stage that provides an output of this type contributes it to the
     posterior's log-likelihood. Return the value as ``LogLikelihood(x)``.
     """
 
@@ -47,8 +47,8 @@ def _as_param_space(params: ParamSpace | Iterable[Param]) -> ParamSpace:
 
 
 def _as_outputs(outputs: Iterable[Sequence[str]]) -> tuple[Output, ...]:
-    """Return ``(stage, slot)`` pairs as a tuple of tuples."""
-    return tuple((stage, slot) for stage, slot in outputs)
+    """Return ``(stage, output)`` pairs as a tuple of tuples."""
+    return tuple((stage, output) for stage, output in outputs)
 
 
 @attrs.frozen(eq=False)
@@ -62,11 +62,11 @@ class Posterior:
         :class:`~yabf.params.Param`.
     stages
         The stages of the forward model. At least one must provide a
-        :class:`LogLikelihood` slot. They are resolved, and checked against
+        :class:`LogLikelihood` output. They are resolved, and checked against
         ``params``, when the posterior is built (see :func:`~yabf.stages.resolve`).
     derived
         Outputs to return as blobs with the log-likelihood, each named by its
-        ``(stage, slot)`` pair.
+        ``(stage, output)`` pair.
     cache_size
         The number of stage results kept across single-point evaluations; see
         :class:`~yabf.pipeline.Pipeline`.
@@ -89,7 +89,7 @@ class Posterior:
         """Check that some stage provides a log-likelihood, and that blobs exist."""
         if not self.likelihoods:
             raise ValueError(
-                "No stage provides a LogLikelihood slot, so the posterior has no "
+                "No stage provides a LogLikelihood output, so the posterior has no "
                 "likelihood."
             )
         unknown = [d for d in self.derived if d not in self.pipeline.outputs]
@@ -98,12 +98,12 @@ class Posterior:
 
     @property
     def likelihoods(self) -> tuple[Output, ...]:
-        """The outputs summed into the log-likelihood, as ``(stage, slot)`` pairs."""
+        """The outputs summed into the log-likelihood, as ``(stage, output)`` pairs."""
         return tuple(
             (s.name, k)
             for s in self.pipeline.graph.stages
-            for k, slot in s.provides.items()
-            if issubclass(as_slot(slot).type, LogLikelihood)
+            for k, kind in s.provides.items()
+            if issubclass(kind, LogLikelihood)
         )
 
     @property
@@ -129,7 +129,7 @@ class Posterior:
     ) -> dict[Output, object]:
         """Compute the forward model at ``theta``: every stage output, by default.
 
-        ``want`` restricts the result to some ``(stage, slot)`` outputs. For a batch
+        ``want`` restricts the result to some ``(stage, output)`` outputs. For a batch
         of points, each output is a tuple with one value per point.
         """
         theta = self._check_theta(theta)

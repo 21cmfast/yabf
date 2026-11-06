@@ -1,30 +1,32 @@
 """Stages, and the graph that connects them.
 
-A stage is one pure computation. It declares the model parameters it consumes, each
-with a :class:`ParamSpec`, the typed inputs it requires and the typed outputs it
-provides, and its ``compute`` method turns parameters and inputs into outputs. Any
-object with these attributes is a stage:
+A stage is one pure computation. It declares the model parameters it takes, each with
+a :class:`ParamSpec`, the named inputs it requires and the named outputs it provides,
+and its ``compute`` method turns parameters and inputs into outputs. Any object with
+these attributes is a stage:
 
 .. code-block:: python
 
     @attrs.frozen
     class Smooth:
         name: str = "smooth"
-        consumes = {
+        parameters = {
             "width": ParamSpec(1.0, domain=(0, np.inf), description="Scale, in Mpc."),
         }
-        requires = {"field": Field}
-        provides = {"smoothed": Slot(Field, tag="smoothed")}
+        requires = {"density": Field}
+        provides = {"smoothed_density": Field}
 
-        def compute(self, params: Mapping, field: Field) -> dict[str, Field]:
-            '''Smooth the field on the scale ``width``.'''
-            return {"smoothed": field.smoothed(params["width"])}
+        def compute(self, params: Mapping, density: Field) -> dict[str, Field]:
+            '''Smooth the density field on the scale ``width``.'''
+            return {"smoothed_density": density.smoothed(params["width"])}
 
-Inputs and outputs are matched by :class:`Slot`, a type and a tag, never by the name
-of the stage that produced them. :func:`resolve` links each requirement to the single
-output that matches it, or, for an :class:`All` requirement, to every output that
-matches it. It also checks the parameter space against what each stage accepts, and
-reports every problem it finds before anything is computed.
+Outputs have a name and a type. An input asks for an output by its name and type: here,
+``Smooth`` takes the ``Field`` named ``"density"`` that some other stage provides,
+whichever stage that is, and provides a ``Field`` named ``"smoothed_density"``. An input
+can also ask for the only output of a type, whatever its name (:class:`One`), or for
+every output that matches (:class:`All`). :func:`resolve` links each input to the
+outputs that match it. It also checks the parameter space against what each stage
+accepts, and reports every problem it finds before anything is computed.
 """
 
 from __future__ import annotations
@@ -89,7 +91,7 @@ class ParamSpec:
     shape
         The shape of the value: ``()`` for a scalar. A stage whose parameters depend
         on its configuration builds its specs from it: a polynomial stage of order
-        ``n`` consumes ``ParamSpec(shape=(n,))``.
+        ``n`` takes ``ParamSpec(shape=(n,))``.
     description
         What the parameter means, for people reading the stage.
     """
@@ -125,89 +127,116 @@ class ParamSpec:
         return None
 
 
-@attrs.frozen
-class Slot:
-    """A typed input or output of a stage, matched by its type and tag.
+def _names(value: str | Iterable[str] | None) -> tuple[str, ...] | None:
+    """Return the output names a requirement accepts: None for any name."""
+    if value is None:
+        return None
+    names = (value,) if isinstance(value, str) else tuple(value)
+    if not names or not all(isinstance(n, str) for n in names):
+        raise TypeError(f"Output names must be strings, got {value!r}.")
+    return names
 
-    A required slot is satisfied by a provided slot with the same tag whose type is
-    the required type or a subclass of it. Tags tell apart several outputs of the
-    same type, such as the power spectra of two fields.
+
+def _describe(kind: type, names: tuple[str, ...] | None) -> str:
+    """Describe the outputs that a type and some names match, for messages."""
+    what = kind.__qualname__
+    if names is None:
+        return f"{what} (any name)"
+    return f"{what} named " + " or ".join(repr(n) for n in names)
+
+
+@attrs.frozen
+class One:
+    """A requirement for the single output that matches a type and, optionally, names.
+
+    ``One(Curve)`` is the only ``Curve`` output in the graph, whatever its name: for a
+    stage that needs an input of some kind, but not a particular one. ``One(Spectrum,
+    name="observed")`` is the ``Spectrum`` named ``"observed"``, received under another
+    argument name. In ``requires``, a bare type ``T`` under the key ``k`` is
+    ``One(T, name=k)``. :func:`resolve` reports an error unless exactly one output, of
+    another stage, matches.
+
+    Parameters
+    ----------
+    type
+        The type of the output; a subclass matches too.
+    name
+        The name of the output, or several names to accept any one of them; ``None``
+        (the default) accepts any name.
     """
 
     type: type = attrs.field(validator=attrs.validators.instance_of(type))
-    tag: str = attrs.field(default="", validator=attrs.validators.instance_of(str))
+    name: tuple[str, ...] | None = attrs.field(default=None, converter=_names)
 
-    def satisfies(self, required: Slot) -> bool:
-        """Whether this provided slot can feed ``required``."""
-        return self.tag == required.tag and issubclass(self.type, required.type)
+    def matches(self, name: str, kind: type) -> bool:
+        """Whether an output with this name and type satisfies the requirement."""
+        return issubclass(kind, self.type) and (self.name is None or name in self.name)
 
     def __str__(self) -> str:
-        """Describe the slot for error messages."""
-        name = self.type.__qualname__
-        return f"{name}[{self.tag!r}]" if self.tag else name
-
-
-def as_slot(slot: Slot | type) -> Slot:
-    """Return ``slot`` as a :class:`Slot`; a bare type has the empty tag."""
-    if isinstance(slot, Slot):
-        return slot
-    if isinstance(slot, type):
-        return Slot(slot)
-    raise TypeError(f"A slot must be a type or a Slot, got {slot!r}.")
+        """Describe the requirement for messages."""
+        return f"a {_describe(self.type, self.name)}"
 
 
 @attrs.frozen
 class All:
-    """A requirement for every output that matches a slot, from any number of stages.
+    """A requirement for every output that matches a type and, optionally, names.
 
-    A stage that requires ``All(Spectrum, tag="model")`` receives a tuple of every
-    ``Spectrum`` output tagged ``"model"``, in the order the stages were given, without
-    naming the stages that provide them: a residual (data minus every model
-    component) or a sum of components, say. A stage's own outputs never satisfy its
-    ``All`` requirements.
+    A stage that requires ``All(Spectrum, name="component")`` receives a tuple of every
+    ``Spectrum`` named ``"component"``, in the order the stages were given, without
+    naming the stages that provide them: to sum the components of a model, say.
+    ``All(Spectrum)`` receives every ``Spectrum``, whatever its name. A stage's own
+    outputs never satisfy its requirements.
 
     Parameters
     ----------
-    type, tag
-        The slot to match, as for :class:`Slot`.
+    type
+        The type of the outputs; subclasses match too.
+    name
+        The name of the outputs, or several names to accept any of them; ``None`` (the
+        default) accepts any name.
     min
         The fewest matching outputs allowed. The default of one catches a mistyped
-        tag; zero allows none.
+        name; zero allows none.
     """
 
     type: type = attrs.field(validator=attrs.validators.instance_of(type))
-    tag: str = attrs.field(default="", validator=attrs.validators.instance_of(str))
+    name: tuple[str, ...] | None = attrs.field(default=None, converter=_names)
     min: int = attrs.field(default=1, kw_only=True, validator=attrs.validators.ge(0))
 
-    @property
-    def slot(self) -> Slot:
-        """The slot that each matching output satisfies."""
-        return Slot(self.type, self.tag)
+    def matches(self, name: str, kind: type) -> bool:
+        """Whether an output with this name and type satisfies the requirement."""
+        return issubclass(kind, self.type) and (self.name is None or name in self.name)
 
     def __str__(self) -> str:
-        """Describe the requirement for error messages."""
-        return f"every {self.slot}"
+        """Describe the requirement for messages."""
+        return f"every {_describe(self.type, self.name)}"
 
 
-def _as_requirement(req: Slot | All | type) -> Slot | All:
-    """Return a requirement as an :class:`All` or a :class:`Slot`."""
-    return req if isinstance(req, All) else as_slot(req)
+def _as_requirement(key: str, req: One | All | type) -> One | All:
+    """Return a requirement as :class:`One` or :class:`All`; a bare type is by name."""
+    if isinstance(req, One | All):
+        return req
+    if isinstance(req, type):
+        return One(req, name=key)
+    raise TypeError(f"Input {key!r} must be a type, One(...) or All(...), got {req!r}.")
 
 
 @runtime_checkable
 class Stage(Protocol):
     """The interface a stage must provide.
 
-    ``consumes`` maps the name of each model parameter the stage accepts to a
-    :class:`ParamSpec`. ``compute`` receives every one of them: the value from the
-    parameter space, or the default from the spec. It is read from the stage instance,
-    so it can be a property that depends on the instance's configuration: the number
-    of terms of a polynomial, say, which sets the length of its coefficient vector.
+    ``parameters`` maps the name of each model parameter the stage takes to a
+    :class:`ParamSpec`. ``compute`` receives every one of them, in its first argument:
+    the value from the parameter space, or the default from the spec. It is read from
+    the stage instance, so it can be a property that depends on the instance's
+    configuration: the number of terms of a polynomial, say, which sets the length of
+    its coefficient vector.
 
-    ``requires`` and ``provides`` map slot names to slots (or bare types). The slot
-    names of ``requires`` are the keyword arguments ``compute`` receives, and those of
-    ``provides`` are the keys of the dictionary it returns. A requirement may also be
-    :class:`All`, for which ``compute`` receives a tuple of every matching output.
+    ``provides`` maps the name of each output to its type, and ``compute`` returns a
+    dictionary with those keys. ``requires`` maps the name of each input, the keyword
+    argument ``compute`` receives it as, to what it needs: a type, for the output of
+    that name and type; :class:`One`, for the only output of a type, or of a type and
+    other names; or :class:`All`, for a tuple of every matching output.
 
     A stage may also define ``check(params)``, which raises ``ValueError`` if a set of
     parameter values is inconsistent in a way no single :class:`ParamSpec` can express
@@ -221,40 +250,35 @@ class Stage(Protocol):
 
     A stage may set ``batched = True`` to compute many points in one call, as an
     emulator or a vectorised likelihood can. It is then called with a batch of ``n``
-    points: each parameter has a leading axis of length ``n``, each required slot
-    receives a sequence of ``n`` values (what the stage would receive at each point),
-    and each provided slot must be a sequence of ``n`` values, one per point. A batched
-    stage is also called this way, with ``n = 1``, when a single point is evaluated.
+    points: each parameter has a leading axis of length ``n``, each input is a sequence
+    of ``n`` values (what the stage would receive at each point), and each output must
+    be a sequence of ``n`` values, one per point. A batched stage is also called this
+    way, with ``n = 1``, when a single point is evaluated.
     """
 
     name: str
-    consumes: Mapping[str, ParamSpec]
-    requires: Mapping[str, Slot | All | type]
-    provides: Mapping[str, Slot | type]
+    parameters: Mapping[str, ParamSpec]
+    requires: Mapping[str, One | All | type]
+    provides: Mapping[str, type]
 
     def compute(self, params: Mapping[str, Any], **inputs: object) -> dict[str, Any]:
-        """Compute the provided slots from parameters and required inputs."""
+        """Compute the outputs from parameters and inputs."""
         ...
 
 
-def _requires(stage: Stage) -> dict[str, Slot | All]:
-    """The requirements of ``stage``, with bare types made into slots."""
-    return {k: _as_requirement(v) for k, v in stage.requires.items()}
-
-
-def _provides(stage: Stage) -> dict[str, Slot]:
-    """The outputs of ``stage``, with bare types made into slots."""
-    return {k: as_slot(v) for k, v in stage.provides.items()}
+def _requires(stage: Stage) -> dict[str, One | All]:
+    """The requirements of ``stage``, with bare types made into :class:`One`."""
+    return {k: _as_requirement(k, v) for k, v in stage.requires.items()}
 
 
 @attrs.frozen
 class Link:
-    """A required slot of one stage, fed by a provided slot of another."""
+    """An input of one stage, fed by an output of another."""
 
     stage: str
-    slot: str
+    input: str
     provider: str
-    provided: str
+    output: str
 
 
 class GraphError(ValueError):
@@ -274,29 +298,30 @@ class StageError(TypeError):
 
 @attrs.frozen
 class StageGraph:
-    """Stages linked by their slots, in an order in which they can be computed.
+    """Stages linked by their inputs and outputs, in an order they can be computed in.
 
-    Build one with :func:`resolve`.
+    Build one with :func:`resolve`. Printing it shows what each stage takes and
+    provides, and where each input comes from.
     """
 
     stages: tuple[Stage, ...]
     links: tuple[Link, ...]
 
     def inputs_of(self, name: str) -> dict[str, tuple[tuple[str, str], ...]]:
-        """Map each required slot of stage ``name`` to the outputs that feed it.
+        """Map each input of stage ``name`` to the outputs that feed it.
 
-        Outputs are ``(stage, slot)`` pairs: one for an ordinary requirement, any
-        number for an :class:`All` requirement.
+        Outputs are ``(stage, output)`` pairs: one for :class:`One` (or a bare type),
+        any number for :class:`All`.
         """
         return dict(self._inputs[name])
 
     def gather(
         self, name: str, outputs: Mapping[tuple[str, str], Any]
     ) -> dict[str, Any]:
-        """Collect the inputs of stage ``name`` from ``outputs``, keyed by slot name.
+        """Collect the inputs of stage ``name`` from ``outputs``, by input name.
 
-        ``outputs`` maps ``(stage, slot)`` pairs to computed values. An :class:`All`
-        requirement receives a tuple of its values.
+        ``outputs`` maps ``(stage, output)`` pairs to computed values. An :class:`All`
+        input receives a tuple of its values.
         """
         requires = self._requirements[name]
         return {
@@ -306,18 +331,30 @@ class StageGraph:
             for k, srcs in self._inputs[name].items()
         }
 
+    def __str__(self) -> str:
+        """Show each stage's inputs, with their sources, and outputs, in order."""
+        lines = []
+        for s in self.stages:
+            lines.append(s.name)
+            for k, req in self._requirements[s.name].items():
+                sources = ", ".join(f"{p}.{o}" for p, o in self._inputs[s.name][k])
+                lines.append(f"  takes     {k}: {req}, from {sources or 'nothing'}")
+            for k, kind in s.provides.items():
+                lines.append(f"  provides  {k}: {kind.__qualname__}")
+        return "\n".join(lines)
+
     # Lookups computed once per graph: a pipeline uses them on every evaluation.
     @cached_property
-    def _requirements(self) -> dict[str, dict[str, Slot | All]]:
+    def _requirements(self) -> dict[str, dict[str, One | All]]:
         """The requirements of each stage, by stage name."""
         return {s.name: _requires(s) for s in self.stages}
 
     @cached_property
     def _inputs(self) -> dict[str, dict[str, tuple[tuple[str, str], ...]]]:
-        """The outputs feeding each required slot, by stage name and slot name."""
+        """The outputs feeding each input, by stage name and input name."""
         inputs = {s.name: dict.fromkeys(s.requires, ()) for s in self.stages}
         for link in self.links:
-            inputs[link.stage][link.slot] += ((link.provider, link.provided),)
+            inputs[link.stage][link.input] += ((link.provider, link.output),)
         return inputs
 
 
@@ -328,10 +365,10 @@ def _describe_param(p: Param) -> str:
 
 def _unused_params(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
     """Return the parameters that reach no stage, directly or through a tie."""
-    consumed = set().union(*(s.consumes for s in stages))
+    taken = set().union(*(s.parameters for s in stages))
     by_feeds = {p.feeds: p for p in params.params}
     used = set()
-    todo = [f for f in by_feeds if f in consumed]
+    todo = [f for f in by_feeds if f in taken]
     while todo:
         feeds = todo.pop()
         if feeds in used:
@@ -367,7 +404,7 @@ def _param_problems(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
     for p in params.params:
         by_feeds.setdefault(p.feeds, []).append(p)
     for s in stages:
-        for name, spec in s.consumes.items():
+        for name, spec in s.parameters.items():
             if name not in by_feeds and spec.required:
                 found[s.name, name] = (
                     f"Stage {s.name!r} requires the parameter {name!r}, which the "
@@ -393,9 +430,9 @@ def _param_problems(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
     for where, theta in _probes(params):
         values = params.to_model(theta)
         for s in stages:
-            if any((s.name, name) in found for name in s.consumes):
+            if any((s.name, name) in found for name in s.parameters):
                 continue
-            for name, spec in s.consumes.items():
+            for name, spec in s.parameters.items():
                 if name in values and (why := spec.why_not(values[name])):
                     found[s.name, name] = (
                         f"Stage {s.name!r} rejects {name!r} {where}: the value "
@@ -406,7 +443,7 @@ def _param_problems(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
                 continue
             try:
                 check(
-                    {k: values.get(k, spec.default) for k, spec in s.consumes.items()}
+                    {k: values.get(k, spec.default) for k, spec in s.parameters.items()}
                 )
             except ValueError as e:
                 found[s.name, ""] = (
@@ -416,60 +453,91 @@ def _param_problems(stages: Sequence[Stage], params: ParamSpace) -> list[str]:
 
 
 def _link(stages: Sequence[Stage]) -> tuple[list[Link], list[str]]:
-    """Link every required slot to its provider, and describe the ones that fail."""
-    provided = [(s.name, k, slot) for s in stages for k, slot in _provides(s).items()]
+    """Link every input to the outputs that match it, and describe the failures."""
+    outputs = [(s.name, k, kind) for s in stages for k, kind in s.provides.items()]
     links, problems = [], []
     for s in stages:
         for k, need in _requires(s).items():
+            matches = [
+                (stage, name)
+                for stage, name, kind in outputs
+                if stage != s.name and need.matches(name, kind)
+            ]
+            where = f"Stage {s.name!r} requires {need} (input {k!r})"
             if isinstance(need, All):
-                matches = [
-                    (name, slot)
-                    for name, slot, have in provided
-                    if name != s.name and have.satisfies(need.slot)
-                ]
                 links.extend(Link(s.name, k, *m) for m in matches)
                 if len(matches) < need.min:
-                    found = "1 stage provides" if matches else "no stage provides"
-                    if len(matches) > 1:
-                        found = f"{len(matches)} stages provide"
                     problems.append(
-                        f"Stage {s.name!r} requires {need} (slot {k!r}), at least "
-                        f"{need.min}, but {found} one."
+                        f"{where}, at least {need.min}, but "
+                        f"{len(matches) or 'no'} output{'s' * (len(matches) != 1)} "
+                        "match."
                     )
                 continue
-            matches = [
-                (name, slot) for name, slot, have in provided if have.satisfies(need)
-            ]
             if len(matches) == 1:
                 links.append(Link(s.name, k, *matches[0]))
                 continue
-            where = f"Stage {s.name!r} requires {need} (slot {k!r})"
             if matches:
-                found = ", ".join(f"{n!r} (slot {m!r})" for n, m in matches)
-                problems.append(
-                    f"{where}, which is provided by more than one stage: {found}. "
-                    "Give the outputs distinct tags."
+                found = ", ".join(f"{stage}.{name}" for stage, name in matches)
+                kind = need.type.__qualname__
+                fix = (
+                    f"Name the one to use, with One({kind}, name=...)."
+                    if need.name is None
+                    else "Give the outputs distinct names."
                 )
+                problems.append(f"{where}, but several outputs match: {found}. {fix}")
                 continue
-            other_tags = [
-                f"{name!r} provides {have}"
-                for name, _, have in provided
-                if issubclass(have.type, need.type)
+            same_type = [
+                f"{stage}.{name}"
+                for stage, name, kind in outputs
+                if stage != s.name and issubclass(kind, need.type)
             ]
-            hint = f" ({'; '.join(other_tags)})" if other_tags else ""
+            hint = (
+                f" (outputs of that type: {', '.join(same_type)})" if same_type else ""
+            )
             problems.append(f"{where}, but no stage provides it{hint}.")
     return links, problems
 
 
+def _declaration_problems(stage: Stage) -> list[str]:
+    """Describe what is malformed in the declarations of ``stage``."""
+    problems = []
+    if not isinstance(stage.parameters, Mapping) or not all(
+        isinstance(spec, ParamSpec) for spec in stage.parameters.values()
+    ):
+        problems.append(
+            f"Stage {stage.name!r} must declare `parameters` as a mapping from "
+            f"parameter names to ParamSpec, got {stage.parameters!r}."
+        )
+    if not all(isinstance(kind, type) for kind in stage.provides.values()):
+        problems.append(
+            f"Stage {stage.name!r} must declare `provides` as a mapping from output "
+            f"names to types, got {stage.provides!r}."
+        )
+    for k, req in stage.requires.items():
+        try:
+            _as_requirement(k, req)
+        except TypeError as e:
+            problems.append(f"Stage {stage.name!r}: {e}")
+    if "params" in stage.requires:
+        problems.append(
+            f"Stage {stage.name!r} has an input named 'params', which is reserved for "
+            "the parameters passed to compute(); rename the input."
+        )
+    return problems
+
+
 def resolve(stages: Iterable[Stage], params: ParamSpace | None = None) -> StageGraph:
-    """Link stages by their slots, and check the graph without computing anything.
+    """Link stages by their inputs and outputs, and check the graph, computing nothing.
 
     Raises
     ------
+    TypeError
+        If a stage is malformed: its ``parameters``, ``requires`` or ``provides`` are
+        not what :class:`Stage` describes.
     GraphError
-        Listing every problem found: duplicate stage names, a required slot that no
-        stage or more than one stage provides, and cycles. Given ``params``, also a
-        parameter that no stage consumes (directly or through a tie), a required
+        Listing every problem found: duplicate stage names, an input that no output
+        or (for :class:`One`) several outputs match, and cycles. Given ``params``,
+        also a parameter that no stage takes (directly or through a tie), a required
         parameter that ``params`` does not define, and a parameter whose values reach
         outside what a stage accepts, either at the edges of its prior or at a few
         points of the parameter space where each stage's ``check`` is also run.
@@ -478,13 +546,9 @@ def resolve(stages: Iterable[Stage], params: ParamSpace | None = None) -> StageG
     for s in stages:
         if not isinstance(s, Stage):
             raise TypeError(f"{s!r} is not a stage: see yabf.stages.Stage.")
-        if not isinstance(s.consumes, Mapping) or not all(
-            isinstance(spec, ParamSpec) for spec in s.consumes.values()
-        ):
-            raise TypeError(
-                f"Stage {s.name!r} must declare `consumes` as a mapping from parameter "
-                f"names to ParamSpec, got {s.consumes!r}."
-            )
+    malformed = [p for s in stages for p in _declaration_problems(s)]
+    if malformed:
+        raise TypeError("\n".join(malformed))
 
     problems = []
     names = [s.name for s in stages]
@@ -493,12 +557,6 @@ def resolve(stages: Iterable[Stage], params: ParamSpace | None = None) -> StageG
         problems.append(
             f"Several stages are named {dupes}; stage names must be unique."
         )
-    problems.extend(
-        f"Stage {s.name!r} requires a slot named 'params', which is reserved for the "
-        "parameters passed to compute(); rename the slot."
-        for s in stages
-        if "params" in s.requires
-    )
 
     links, link_problems = _link(stages)
     problems += link_problems
@@ -506,7 +564,7 @@ def resolve(stages: Iterable[Stage], params: ParamSpace | None = None) -> StageG
     if params is not None:
         unused = _unused_params(stages, params)
         if unused:
-            problems.append(f"No stage consumes the parameters {', '.join(unused)}.")
+            problems.append(f"No stage takes the parameters {', '.join(unused)}.")
         problems += _param_problems(stages, params)
 
     # Stages are identified by name, so cycles can only be traced once names are unique.
@@ -528,38 +586,38 @@ def resolve(stages: Iterable[Stage], params: ParamSpace | None = None) -> StageG
 def call_stage(
     stage: Stage, params: Mapping[str, Any], inputs: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Compute ``stage`` and check that it returns exactly the slots it provides.
+    """Compute ``stage`` and check that it returns exactly the outputs it provides.
 
-    The stage receives every parameter it consumes: the value in ``params``, or the
+    The stage receives every parameter it takes: the value in ``params``, or the
     default from its :class:`ParamSpec`. Other entries of ``params`` are ignored.
 
     Raises
     ------
     StageError
         If ``params`` lacks a required parameter, or the outputs are not exactly the
-        provided slots, or one has the wrong type.
+        provided ones, or one has the wrong type.
     """
     missing = sorted(
-        k for k, spec in stage.consumes.items() if spec.required and k not in params
+        k for k, spec in stage.parameters.items() if spec.required and k not in params
     )
     if missing:
         raise StageError(
             f"Stage {stage.name!r} requires the parameters {missing}, which were not "
             "given."
         )
-    consumed = {k: params.get(k, spec.default) for k, spec in stage.consumes.items()}
-    out = stage.compute(consumed, **inputs)
-    provides = _provides(stage)
+    taken = {k: params.get(k, spec.default) for k, spec in stage.parameters.items()}
+    out = stage.compute(taken, **inputs)
+    provides = stage.provides
     if not isinstance(out, Mapping) or set(out) != set(provides):
         got = sorted(out, key=str) if isinstance(out, Mapping) else type(out).__name__
         raise StageError(
             f"Stage {stage.name!r} returned {got}, but provides {sorted(provides)}."
         )
-    for k, slot in provides.items():
-        if not isinstance(out[k], slot.type):
+    for k, kind in provides.items():
+        if not isinstance(out[k], kind):
             raise StageError(
                 f"Stage {stage.name!r} returned a {type(out[k]).__qualname__} for "
-                f"slot {k!r}, which provides {slot}."
+                f"output {k!r}, which is a {kind.__qualname__}."
             )
     return dict(out)
 
@@ -573,47 +631,47 @@ def call_stage_batch(
     """Compute a batched ``stage`` at ``n`` points, checking what it returns.
 
     ``params`` maps parameter names to arrays with a leading axis of length ``n``, and
-    ``inputs`` maps each required slot to a sequence of ``n`` values. A parameter the
-    stage consumes but ``params`` lacks takes its default, repeated along the batch.
+    ``inputs`` maps each input to a sequence of ``n`` values. A parameter the stage
+    takes but ``params`` lacks has its default, repeated along the batch.
 
     Raises
     ------
     StageError
         If ``params`` lacks a required parameter, or the outputs are not exactly the
-        provided slots, each a sequence of ``n`` values of the slot's type.
+        provided ones, each a sequence of ``n`` values of the output's type.
     """
     missing = sorted(
-        k for k, spec in stage.consumes.items() if spec.required and k not in params
+        k for k, spec in stage.parameters.items() if spec.required and k not in params
     )
     if missing:
         raise StageError(
             f"Stage {stage.name!r} requires the parameters {missing}, which were not "
             "given."
         )
-    consumed = {
+    taken = {
         k: np.asarray(params[k])
         if k in params
         else np.broadcast_to(spec.default, (n, *np.shape(spec.default)))
-        for k, spec in stage.consumes.items()
+        for k, spec in stage.parameters.items()
     }
-    out = stage.compute(consumed, **inputs)
-    provides = _provides(stage)
+    out = stage.compute(taken, **inputs)
+    provides = stage.provides
     if not isinstance(out, Mapping) or set(out) != set(provides):
         got = sorted(out, key=str) if isinstance(out, Mapping) else type(out).__name__
         raise StageError(
             f"Stage {stage.name!r} returned {got}, but provides {sorted(provides)}."
         )
-    for k, slot in provides.items():
+    for k, kind in provides.items():
         values = out[k]
         if not isinstance(values, Sequence | np.ndarray) or len(values) != n:
             raise StageError(
                 f"Batched stage {stage.name!r} must return a sequence of {n} values "
-                f"for slot {k!r}, one per point."
+                f"for output {k!r}, one per point."
             )
-        wrong = [type(v).__qualname__ for v in values if not isinstance(v, slot.type)]
+        wrong = [type(v).__qualname__ for v in values if not isinstance(v, kind)]
         if wrong:
             raise StageError(
-                f"Batched stage {stage.name!r} returned a {wrong[0]} for slot {k!r}, "
-                f"which provides {slot}."
+                f"Batched stage {stage.name!r} returned a {wrong[0]} for output "
+                f"{k!r}, which is a {kind.__qualname__}."
             )
     return dict(out)

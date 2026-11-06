@@ -14,8 +14,8 @@ from yabf.stages import (
     REQUIRED,
     All,
     GraphError,
+    One,
     ParamSpec,
-    Slot,
     StageError,
     call_stage,
     resolve,
@@ -41,9 +41,9 @@ class Simulator:
     """A white-noise field with standard deviation ``sigma``, on a fixed realisation."""
 
     name: str = "sim"
-    tag: str = ""
+    output_name: str = "field"
     output: type = Field
-    consumes: ClassVar = {
+    parameters: ClassVar = {
         "sigma": ParamSpec(REQUIRED, domain=(0, 10), description="Standard deviation."),
         "seed": ParamSpec(0, description="Seed of the realisation."),
     }
@@ -51,26 +51,26 @@ class Simulator:
 
     @property
     def provides(self):
-        return {"field": Slot(self.output, self.tag)}
+        return {self.output_name: self.output}
 
     def compute(self, params):
         noise = np.random.default_rng(int(params["seed"])).standard_normal(4096)
-        return {"field": self.output(params["sigma"] * noise)}
+        return {self.output_name: self.output(params["sigma"] * noise)}
 
 
 @attrs.frozen
 class Measure:
-    """The variance of a field."""
+    """The variance of a field: by default, the Field named "field"."""
 
     name: str = "measure"
-    tag: str = ""
-    slot: str = "field"
-    consumes: ClassVar = {}
+    need: object = Field
+    input: str = "field"
+    parameters: ClassVar = {}
     provides: ClassVar = {"var": Variance}
 
     @property
     def requires(self):
-        return {self.slot: Slot(Field, self.tag)}
+        return {self.input: self.need}
 
     def compute(self, params, **inputs):
         (field,) = inputs.values()
@@ -82,7 +82,7 @@ class Likelihood:
     """A Gaussian likelihood for the measured variance."""
 
     name: str = "like"
-    consumes: ClassVar = {"noise": ParamSpec(0.0, domain=(0, np.inf))}
+    parameters: ClassVar = {"noise": ParamSpec(0.0, domain=(0, np.inf))}
     requires: ClassVar = {"var": Variance}
     provides: ClassVar = {"lnl": float}
 
@@ -95,7 +95,7 @@ def _run(graph, params):
     outputs = {}
     for stage in graph.stages:
         out = call_stage(stage, params, graph.gather(stage.name, outputs))
-        outputs.update({(stage.name, slot): value for slot, value in out.items()})
+        outputs.update({(stage.name, k): value for k, value in out.items()})
     return outputs
 
 
@@ -151,7 +151,7 @@ def test_toy_stages_obey_the_stage_contract(stage):
 class Spy:
     seen: list = attrs.field(factory=list, eq=False)
     name: str = "spy"
-    consumes: ClassVar = {"a": ParamSpec(REQUIRED), "b": ParamSpec(2.0)}
+    parameters: ClassVar = {"a": ParamSpec(REQUIRED), "b": ParamSpec(2.0)}
     requires: ClassVar = {}
     provides: ClassVar = {}
 
@@ -160,7 +160,7 @@ class Spy:
         return {}
 
 
-def test_a_stage_receives_what_it_consumes_with_defaults_for_the_rest():
+def test_a_stage_receives_its_parameters_with_defaults_for_the_rest():
     spy = Spy()
     call_stage(spy, {"a": 1.0, "c": 3.0}, {})
     assert spy.seen == [{"a": 1.0, "b": 2.0}]
@@ -177,7 +177,7 @@ def test_a_missing_required_parameter_is_reported_before_computing():
 class Broken:
     name: str = "broken"
     returns: object = None
-    consumes: ClassVar = {}
+    parameters: ClassVar = {}
     requires: ClassVar = {}
     provides: ClassVar = {"var": Variance}
 
@@ -190,7 +190,7 @@ class Broken:
     [
         ({}, r"returned \[\], but provides \['var'\]"),
         ({"var": Variance(1.0), "extra": 1.0}, r"returned \['extra', 'var'\]"),
-        ({"var": 1.0}, "returned a float for slot 'var', which provides Variance"),
+        ({"var": 1.0}, "returned a float for output 'var', which is a Variance"),
         ({"var": Variance(1.0), 1: 1.0}, r"returned \[1, 'var'\]"),
         (Variance(1.0), "returned Variance"),
     ],
@@ -201,14 +201,31 @@ def test_a_stage_that_breaks_its_contract_is_reported(returns, match):
         call_stage(Broken(returns=returns), {}, {})
 
 
-def test_tags_pick_between_outputs_of_the_same_type():
-    stages = [
-        Simulator(name="sim_a", tag="a"),
-        Simulator(name="sim_b", tag="b"),
-        Measure(name="measure_b", tag="b"),
-    ]
-    graph = resolve(stages)
-    assert graph.inputs_of("measure_b") == {"field": (("sim_b", "field"),)}
+@pytest.mark.parametrize(
+    ("stages", "need", "provider"),
+    [
+        # A bare type takes the output of the input's name.
+        ([Simulator(name="sim_a", output_name="a"), Simulator()], Field, "sim"),
+        # One(type) takes the only output of the type, whatever its name.
+        ([Simulator(output_name="density")], One(Field), "sim"),
+        # One(type, name=...) picks between outputs of the same type.
+        (
+            [Simulator(name="sim_a", output_name="a"), Simulator(name="sim_b")],
+            One(Field, name="a"),
+            "sim_a",
+        ),
+        (
+            [Simulator(name="sim_a", output_name="a"), Simulator(output_name="b")],
+            One(Field, name=["b", "c"]),
+            "sim",
+        ),
+    ],
+    ids=["by_input_name", "only_of_type", "named", "one_of_names"],
+)
+def test_an_input_takes_the_output_that_matches_its_requirement(stages, need, provider):
+    graph = resolve([*stages, Measure(need=need)])
+    ((source, _),) = graph.inputs_of("measure")["field"]
+    assert source == provider
 
 
 def test_a_subclass_satisfies_a_requirement_for_its_base_type():
@@ -227,42 +244,44 @@ def _problems(stages, params=None):
     [
         (
             [Measure()],
-            "Stage 'measure' requires Field (slot 'field'), but no stage provides it.",
+            (
+                "Stage 'measure' requires a Field named 'field' (input 'field'), but "
+                "no stage provides it."
+            ),
         ),
         (
-            [Simulator(tag="raw"), Measure()],
+            [Simulator(output_name="density"), Measure()],
             (
-                "Stage 'measure' requires Field (slot 'field'), but no stage provides "
-                "it ('sim' provides Field['raw'])."
+                "Stage 'measure' requires a Field named 'field' (input 'field'), but "
+                "no stage provides it (outputs of that type: sim.density)."
             ),
         ),
         (
             [Simulator(name="sim_a"), Simulator(name="sim_b"), Measure()],
             (
-                "Stage 'measure' requires Field (slot 'field'), which is provided by "
-                "more than one stage: 'sim_a' (slot 'field'), 'sim_b' (slot 'field'). "
-                "Give the outputs distinct tags."
+                "Stage 'measure' requires a Field named 'field' (input 'field'), but "
+                "several outputs match: sim_a.field, sim_b.field. Give the outputs "
+                "distinct names."
+            ),
+        ),
+        (
+            [
+                Simulator(name="sim_a", output_name="a"),
+                Simulator(name="sim_b", output_name="b"),
+                Measure(need=One(Field)),
+            ],
+            (
+                "Stage 'measure' requires a Field (any name) (input 'field'), but "
+                "several outputs match: sim_a.a, sim_b.b. Name the one to use, with "
+                "One(Field, name=...)."
             ),
         ),
         (
             [Simulator(), Simulator(), Measure()],
             "Several stages are named ['sim']; stage names must be unique.",
         ),
-        (
-            [Measure(name="params_slot", slot="params")],
-            (
-                "Stage 'params_slot' requires a slot named 'params', which is reserved "
-                "for the parameters passed to compute(); rename the slot."
-            ),
-        ),
     ],
-    ids=[
-        "missing",
-        "missing_with_other_tag",
-        "ambiguous",
-        "duplicate_names",
-        "reserved_slot_name",
-    ],
+    ids=["missing", "missing_with_other_name", "ambiguous", "ambiguous_type", "dupes"],
 )
 def test_unresolvable_graphs_are_reported_with_readable_messages(stages, expected):
     assert expected in _problems(stages)
@@ -274,7 +293,7 @@ def test_a_cycle_is_reported():
         """Requires the variance and provides the field it is measured from."""
 
         name: str = "feedback"
-        consumes: ClassVar = {}
+        parameters: ClassVar = {}
         requires: ClassVar = {"var": Variance}
         provides: ClassVar = {"field": Field}
 
@@ -286,7 +305,7 @@ def test_a_cycle_is_reported():
     assert "measure -> feedback" in problem or "feedback -> measure" in problem
 
 
-def test_parameters_that_no_stage_consumes_are_reported():
+def test_parameters_that_no_stage_takes_are_reported():
     params = ParamSpace(
         [
             Param("sigma", prior=(0.5, 2.0)),
@@ -296,11 +315,11 @@ def test_parameters_that_no_stage_consumes_are_reported():
     )
     (problem,) = _problems(TOY, params)
     assert problem == (
-        "No stage consumes the parameters 'F_STAR10', 'log10_x' (feeds 'x')."
+        "No stage takes the parameters 'F_STAR10', 'log10_x' (feeds 'x')."
     )
 
 
-def test_a_parameter_used_through_a_tie_counts_as_consumed():
+def test_a_parameter_used_through_a_tie_counts_as_taken():
     # 'base' reaches the simulator only as the input of the tied 'sigma'.
     params = ParamSpace(
         [Param("base", prior=(0.5, 2.0)), Param("sigma", tied={"base": 2.0})]
@@ -314,9 +333,9 @@ def test_every_problem_is_reported_at_once():
     problems = "\n".join(_problems(stages, params))
     for expected in [
         "named ['like']",
-        "Stage 'm1' requires Field (slot 'field'), but no stage provides it",
-        "Stage 'm2' requires Field (slot 'field'), but no stage provides it",
-        "Stage 'like' requires Variance (slot 'var'), which is provided by more",
+        "Stage 'm1' requires a Field named 'field' (input 'field'), but no stage",
+        "Stage 'm2' requires a Field named 'field' (input 'field'), but no stage",
+        "Stage 'like' requires a Variance named 'var' (input 'var'), but several",
         "'unused'",
     ]:
         assert expected in problems
@@ -336,19 +355,39 @@ def test_inconsistent_param_specs_are_rejected(kwargs, match):
         ParamSpec(**kwargs)
 
 
-def test_consumes_must_describe_each_parameter():
-    @attrs.frozen
-    class Bare:
-        name: str = "bare"
-        consumes: ClassVar = frozenset({"x"})
-        requires: ClassVar = {}
-        provides: ClassVar = {}
+@attrs.frozen
+class Declared:
+    """A stage whose declarations are given at construction."""
 
-        def compute(self, params):
-            return {}
+    parameters: object = attrs.field(factory=dict)
+    requires: object = attrs.field(factory=dict)
+    provides: object = attrs.field(factory=dict)
+    name: str = "declared"
 
-    with pytest.raises(TypeError, match="mapping from parameter names to ParamSpec"):
-        resolve([Bare()])
+    def compute(self, params, **inputs):
+        return {}
+
+
+@pytest.mark.parametrize(
+    ("stage", "match"),
+    [
+        (Declared(parameters=frozenset({"x"})), "mapping from parameter names to"),
+        (Declared(provides={"x": Field(np.zeros(1))}), "output names to types"),
+        (Declared(requires={"x": "Field"}), "must be a type, One"),
+        (Declared(requires={"params": Field}), "'params', which is reserved"),
+    ],
+    ids=["parameters", "provides", "requires", "reserved_input_name"],
+)
+def test_malformed_declarations_are_rejected(stage, match):
+    with pytest.raises(TypeError, match=match):
+        resolve([stage])
+
+
+@pytest.mark.parametrize("requirement", [One, All])
+@pytest.mark.parametrize("name", [[], [1], ("a", None)], ids=["empty", "int", "none"])
+def test_requirements_need_string_output_names(requirement, name):
+    with pytest.raises(TypeError, match="Output names must be strings"):
+        requirement(Field, name=name)
 
 
 @attrs.frozen
@@ -356,7 +395,7 @@ class Bubbles:
     """Bubbles of radius up to ``r_max`` in a box of side ``box``, at most a third."""
 
     name: str = "bubbles"
-    consumes: ClassVar = {
+    parameters: ClassVar = {
         "box": ParamSpec(100.0, domain=(0, np.inf)),
         "r_max": ParamSpec(15.0, domain=(0, np.inf)),
         "weights": ParamSpec((1.0, 1.0), shape=(2,)),
@@ -488,21 +527,21 @@ class PowerLaw:
 
     name: str
     index: float = -2.5
-    tag: str = "model"
+    output: str = "model"
 
     @property
-    def consumes(self):
+    def parameters(self):
         return {f"{self.name}_amp": ParamSpec(REQUIRED)}
 
     requires: ClassVar = {}
 
     @property
     def provides(self):
-        return {"spectrum": Slot(Spectrum, self.tag)}
+        return {self.output: Spectrum}
 
     def compute(self, params):
         amp = params[f"{self.name}_amp"]
-        return {"spectrum": Spectrum(amp * (FREQS / 75.0) ** self.index)}
+        return {self.output: Spectrum(amp * (FREQS / 75.0) ** self.index)}
 
 
 @attrs.frozen
@@ -511,13 +550,14 @@ class Residual:
 
     data: np.ndarray = attrs.field(eq=False)
     min_parts: int = 1
+    parts: object = "model"
     name: str = "residual"
-    consumes: ClassVar = {}
-    provides: ClassVar = {"residual": Slot(Spectrum, "residual")}
+    parameters: ClassVar = {}
+    provides: ClassVar = {"residual": Spectrum}
 
     @property
     def requires(self):
-        return {"parts": All(Spectrum, "model", min=self.min_parts)}
+        return {"parts": All(Spectrum, name=self.parts, min=self.min_parts)}
 
     def compute(self, params, parts):
         return {"residual": Spectrum(self.data - sum(p.values for p in parts))}
@@ -535,7 +575,7 @@ def test_a_residual_subtracts_every_model_component_without_naming_them(
     stages = [Residual(model + noise), *components]
     graph = resolve(stages)
     assert graph.inputs_of("residual") == {
-        "parts": tuple((c.name, "spectrum") for c in components)
+        "parts": tuple((c.name, "model") for c in components)
     }
     out = _run(graph, params)
     np.testing.assert_allclose(out["residual", "residual"].values, noise, atol=1e-10)
@@ -547,15 +587,35 @@ def test_a_stage_does_not_collect_its_own_outputs():
         """Sums the model components, and is itself a model component."""
 
         name: str = "total"
-        consumes: ClassVar = {}
-        requires: ClassVar = {"parts": All(Spectrum, "model")}
-        provides: ClassVar = {"total": Slot(Spectrum, "model")}
+        parameters: ClassVar = {}
+        requires: ClassVar = {"parts": All(Spectrum, name="model")}
+        provides: ClassVar = {"model": Spectrum}
 
         def compute(self, params, parts):
-            return {"total": Spectrum(sum(p.values for p in parts))}
+            return {"model": Spectrum(sum(p.values for p in parts))}
 
     graph = resolve([Total(), PowerLaw("fg")])
-    assert graph.inputs_of("total") == {"parts": (("fg", "spectrum"),)}
+    assert graph.inputs_of("total") == {"parts": (("fg", "model"),)}
+
+
+@pytest.mark.parametrize(
+    ("parts", "expected"),
+    [
+        (None, ["fg", "signal", "other"]),
+        (["model", "other"], ["fg", "signal", "other"]),
+        ("other", ["other"]),
+    ],
+    ids=["any_name", "several_names", "one_name"],
+)
+def test_all_collects_the_outputs_of_any_of_its_names(parts, expected):
+    stages = [
+        Residual(FREQS, parts=parts),
+        PowerLaw("fg"),
+        PowerLaw("signal"),
+        PowerLaw("other", output="other"),
+    ]
+    graph = resolve(stages)
+    assert [p for p, _ in graph.inputs_of("residual")["parts"]] == expected
 
 
 @pytest.mark.parametrize(
@@ -565,16 +625,16 @@ def test_a_stage_does_not_collect_its_own_outputs():
             1,
             0,
             (
-                "Stage 'residual' requires every Spectrum['model'] (slot 'parts'), at "
-                "least 1, but no stage provides one."
+                "Stage 'residual' requires every Spectrum named 'model' (input "
+                "'parts'), at least 1, but no outputs match."
             ),
         ),
         (
             3,
             2,
             (
-                "Stage 'residual' requires every Spectrum['model'] (slot 'parts'), at "
-                "least 3, but 2 stages provide one."
+                "Stage 'residual' requires every Spectrum named 'model' (input "
+                "'parts'), at least 3, but 2 outputs match."
             ),
         ),
     ],
@@ -601,21 +661,21 @@ class Polynomial:
     n: int = 4
     name: str = "poly"
     requires: ClassVar = {}
-    provides: ClassVar = {"spectrum": Slot(Spectrum, "model")}
+    provides: ClassVar = {"model": Spectrum}
 
     @property
-    def consumes(self):
+    def parameters(self):
         return {"p": ParamSpec(REQUIRED, shape=(self.n,), domain=(-100, 100))}
 
     def compute(self, params):
-        return {"spectrum": Spectrum(np.polyval(params["p"][::-1], FREQS / 75))}
+        return {"model": Spectrum(np.polyval(params["p"][::-1], FREQS / 75))}
 
 
 def test_a_vector_of_elements_feeds_a_vector_parameter():
     params = ParamSpace(param_vector("p", 4, prior=(-10.0, 10.0), fixed={1: 0.0}))
     out = _run(resolve([Polynomial()], params), params.to_model(params.fiducial))
     expected = np.polyval([0.0, 0.0, 0.0, 0.0], FREQS / 75)
-    np.testing.assert_allclose(out["poly", "spectrum"].values, expected)
+    np.testing.assert_allclose(out["poly", "model"].values, expected)
 
 
 @pytest.mark.parametrize(
@@ -658,3 +718,12 @@ def test_each_instance_of_a_stage_sets_the_length_of_its_vectors(n):
     other = Polynomial(n + 1)
     (problem,) = _problems([other], params)
     assert problem.endswith(f"has shape ({n},), not ({n + 1},).")
+
+
+def test_a_graph_prints_what_each_stage_takes_and_provides():
+    graph = resolve([Residual(FREQS), PowerLaw("fg"), PowerLaw("signal")])
+    assert str(graph).splitlines()[-3:] == [
+        "residual",
+        "  takes     parts: every Spectrum named 'model', from fg.model, signal.model",
+        "  provides  residual: Spectrum",
+    ]
