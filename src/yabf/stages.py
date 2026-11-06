@@ -96,12 +96,20 @@ class ParamSpec:
         ``n`` takes ``ParamSpec(shape=(n,))``.
     description
         What the parameter means, for people reading the stage.
+    random
+        Whether the parameter is a source of randomness, such as a random seed, rather
+        than a physical quantity. A posterior reports such inputs (see
+        :attr:`~yabf.posterior.Posterior.random_inputs`), since how each is set (left
+        at its default, fixed, or sampled) is an approximation the run makes.
     """
 
     default: Any = REQUIRED
     domain: tuple[float, float] | None = attrs.field(default=None, converter=_domain)
     shape: tuple[int, ...] = attrs.field(default=(), converter=tuple)
     description: str = ""
+    random: bool = attrs.field(
+        default=False, validator=attrs.validators.instance_of(bool), kw_only=True
+    )
 
     def __attrs_post_init__(self) -> None:
         """Check that the default is a value the stage accepts."""
