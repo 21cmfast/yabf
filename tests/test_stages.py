@@ -271,7 +271,7 @@ def _problems(stages, params=None):
                 Measure(need=One(Field)),
             ],
             (
-                "Stage 'measure' requires a Field (any name) (input 'field'), but "
+                "Stage 'measure' requires a Field of any name (input 'field'), but "
                 "several outputs match: sim_a.a, sim_b.b. Name the one to use, with "
                 "One(Field, name=...)."
             ),
