@@ -218,6 +218,13 @@ class Stage(Protocol):
     keep its outputs across evaluations. This suits stages with small outputs, such as
     observables, and not simulators. A cached output must not refer to the stage's
     inputs (a NumPy view of an input field, say), or it keeps them alive.
+
+    A stage may set ``batched = True`` to compute many points in one call, as an
+    emulator or a vectorised likelihood can. It is then called with a batch of ``n``
+    points: each parameter has a leading axis of length ``n``, each required slot
+    receives a sequence of ``n`` values (what the stage would receive at each point),
+    and each provided slot must be a sequence of ``n`` values, one per point. A batched
+    stage is also called this way, with ``n = 1``, when a single point is evaluated.
     """
 
     name: str
@@ -553,5 +560,60 @@ def call_stage(
             raise StageError(
                 f"Stage {stage.name!r} returned a {type(out[k]).__qualname__} for "
                 f"slot {k!r}, which provides {slot}."
+            )
+    return dict(out)
+
+
+def call_stage_batch(
+    stage: Stage,
+    params: Mapping[str, ArrayLike],
+    inputs: Mapping[str, Sequence[object]],
+    n: int,
+) -> dict[str, Sequence[object]]:
+    """Compute a batched ``stage`` at ``n`` points, checking what it returns.
+
+    ``params`` maps parameter names to arrays with a leading axis of length ``n``, and
+    ``inputs`` maps each required slot to a sequence of ``n`` values. A parameter the
+    stage consumes but ``params`` lacks takes its default, repeated along the batch.
+
+    Raises
+    ------
+    StageError
+        If ``params`` lacks a required parameter, or the outputs are not exactly the
+        provided slots, each a sequence of ``n`` values of the slot's type.
+    """
+    missing = sorted(
+        k for k, spec in stage.consumes.items() if spec.required and k not in params
+    )
+    if missing:
+        raise StageError(
+            f"Stage {stage.name!r} requires the parameters {missing}, which were not "
+            "given."
+        )
+    consumed = {
+        k: np.asarray(params[k])
+        if k in params
+        else np.broadcast_to(spec.default, (n, *np.shape(spec.default)))
+        for k, spec in stage.consumes.items()
+    }
+    out = stage.compute(consumed, **inputs)
+    provides = _provides(stage)
+    if not isinstance(out, Mapping) or set(out) != set(provides):
+        got = sorted(out, key=str) if isinstance(out, Mapping) else type(out).__name__
+        raise StageError(
+            f"Stage {stage.name!r} returned {got}, but provides {sorted(provides)}."
+        )
+    for k, slot in provides.items():
+        values = out[k]
+        if not isinstance(values, Sequence | np.ndarray) or len(values) != n:
+            raise StageError(
+                f"Batched stage {stage.name!r} must return a sequence of {n} values "
+                f"for slot {k!r}, one per point."
+            )
+        wrong = [type(v).__qualname__ for v in values if not isinstance(v, slot.type)]
+        if wrong:
+            raise StageError(
+                f"Batched stage {stage.name!r} returned a {wrong[0]} for slot {k!r}, "
+                f"which provides {slot}."
             )
     return dict(out)

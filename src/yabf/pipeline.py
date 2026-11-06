@@ -26,9 +26,10 @@ from typing import Any
 
 import attrs
 import numpy as np
+from numpy.typing import ArrayLike
 
 from .params import ParamSpace
-from .stages import Stage, StageGraph, call_stage, resolve
+from .stages import Stage, StageGraph, call_stage, call_stage_batch, resolve
 
 Output = tuple[str, str]
 
@@ -49,7 +50,11 @@ class Pipeline:
     Build one from stages with :meth:`build`, then call it with the values of the
     model parameters and the outputs wanted, each named by its ``(stage, slot)``
     pair. Stages must not change between evaluations, and must not modify their
-    inputs. A pipeline evaluates one point at a time and is not thread-safe.
+    inputs. A pipeline is not thread-safe.
+
+    Calling the pipeline evaluates one point. :meth:`batch` evaluates many: stages that
+    declare ``batched = True`` are called once for the whole batch, and the others
+    once per point.
 
     Parameters
     ----------
@@ -176,11 +181,33 @@ class Pipeline:
         key: Callable[[str], tuple],
     ) -> None:
         """Compute one stage, then release the inputs that nothing else needs."""
-        out = call_stage(stage, params, self.graph.gather(stage.name, store))
+        inputs = self.graph.gather(stage.name, store)
+        if getattr(stage, "batched", False):
+            batch = {
+                k: np.expand_dims(params[k], 0) for k in stage.consumes if k in params
+            }
+            outs = call_stage_batch(
+                stage, batch, {k: (v,) for k, v in inputs.items()}, 1
+            )
+            out = {k: v[0] for k, v in outs.items()}
+        else:
+            out = call_stage(stage, params, inputs)
+        del inputs
         if self._cacheable(stage):
             self._cache[key(stage.name)] = out
             while len(self._cache) > self.cache_size:
                 self._cache.popitem(last=False)
+        self._keep(stage, out, store, remaining, wanted)
+
+    def _keep(
+        self,
+        stage: Stage,
+        out: Mapping[str, object],
+        store: dict[Output, object],
+        remaining: Counter[Output],
+        wanted: set[Output],
+    ) -> None:
+        """Store the outputs of ``stage`` that are needed, and release spent inputs."""
         for slot, value in out.items():
             if (stage.name, slot) in wanted or remaining[stage.name, slot]:
                 store[stage.name, slot] = value
@@ -189,6 +216,88 @@ class Pipeline:
                 remaining[src] -= 1
                 if not remaining[src] and src not in wanted:
                     del store[src]
+
+    def batch(
+        self,
+        params: Mapping[str, ArrayLike],
+        n: int,
+        want: Iterable[Output] | None = None,
+    ) -> dict[Output, tuple[object, ...]]:
+        """Compute the outputs in ``want`` (default: the final outputs) at ``n`` points.
+
+        ``params`` maps model parameter names to arrays whose leading axis, of length
+        ``n``, runs over the points. Each output is returned as a tuple of ``n`` values.
+
+        A stage that declares ``batched = True`` is called once with the whole batch;
+        the others are called once per point. Consecutive unbatched stages run point by
+        point, so that each point's intermediate products are released before the next
+        point starts. The cache is neither read nor filled.
+        """
+        want = self._check_want(want)
+        wanted = set(want)
+        params = {k: np.asarray(v) for k, v in params.items()}
+        wrong = sorted(k for k, v in params.items() if v.shape[:1] != (n,))
+        if wrong:
+            raise ValueError(
+                f"The parameters {wrong} need a leading batch axis of length {n}."
+            )
+
+        run: set[str] = set()
+        todo = list({name for name, _ in want})
+        while todo:
+            name = todo.pop()
+            if name not in run:
+                run.add(name)
+                todo.extend(
+                    p for srcs in self.graph.inputs_of(name).values() for p, _ in srcs
+                )
+        stages = [s for s in self.graph.stages if s.name in run]
+        consumers = Counter(
+            src
+            for name in run
+            for srcs in self.graph.inputs_of(name).values()
+            for src in srcs
+        )
+        stores: list[dict[Output, object]] = [{} for _ in range(n)]
+        remaining = [consumers.copy() for _ in range(n)]
+
+        # Split the stages, in order, into batched stages and runs of unbatched ones.
+        segments: list[list[Stage]] = []
+        for stage in stages:
+            if (
+                getattr(stage, "batched", False)
+                or not segments
+                or getattr(segments[-1][0], "batched", False)
+            ):
+                segments.append([stage])
+            else:
+                segments[-1].append(stage)
+
+        for segment in segments:
+            if getattr(segment[0], "batched", False):
+                stage = segment[0]
+                per_point = [self.graph.gather(stage.name, st) for st in stores]
+                inputs = {
+                    k: tuple(p[k] for p in per_point)
+                    for k in self.graph.inputs_of(stage.name)
+                }
+                del per_point
+                outs = call_stage_batch(stage, params, inputs, n)
+                del inputs
+                for i in range(n):
+                    out = {k: v[i] for k, v in outs.items()}
+                    self._keep(stage, out, stores[i], remaining[i], wanted)
+                del outs
+                continue
+            for i in range(n):
+                point = {k: v[i] for k, v in params.items()}
+                for stage in segment:
+                    out = call_stage(
+                        stage, point, self.graph.gather(stage.name, stores[i])
+                    )
+                    self._keep(stage, out, stores[i], remaining[i], wanted)
+                    del out
+        return {w: tuple(st[w] for st in stores) for w in want}
 
     def _check_want(self, want: Iterable[Output] | None) -> tuple[Output, ...]:
         """Return the requested outputs as a tuple, checking the pipeline has them."""
