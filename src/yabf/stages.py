@@ -141,7 +141,7 @@ def _describe(kind: type, names: tuple[str, ...] | None) -> str:
     """Describe the outputs that a type and some names match, for messages."""
     what = kind.__qualname__
     if names is None:
-        return f"{what} (any name)"
+        return f"{what} of any name"
     return f"{what} named " + " or ".join(repr(n) for n in names)
 
 
