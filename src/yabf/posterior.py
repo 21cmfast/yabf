@@ -10,15 +10,21 @@ call:
     posterior = Posterior(params=[...], stages=[...], derived=[("sim", "xHI")])
     out = posterior.forward(theta)  # every output of every stage
     lnl, blobs = posterior.log_likelihood(theta)
+    lp, blobs = posterior.log_posterior(theta)
 
 The log-likelihood is the sum of every stage output whose type is
 :class:`LogLikelihood`, and the blobs are the outputs listed in ``derived``. The
 simplest way to add one is a :class:`LikelihoodTerm`, which scores a model output
-against data with a :mod:`~yabf.likelihoods` likelihood, after an optional chain of
-instrument stages of its own; ``posterior.simulate(theta, rng)`` then draws mock data
-from the same likelihoods.
+against data with a :mod:`~yabf.likelihoods` likelihood. ``posterior.simulate(theta,
+rng)`` then draws mock data from the same likelihoods. To analyse a mock, build the
+posterior without data, simulate, and add the mock with :meth:`Posterior.with_data`:
 
-Both methods take one point, ``theta`` of shape ``(ndim,)``, or a batch of points,
+.. code-block:: python
+
+    model = Posterior(params, stages, likelihoods=[LikelihoodTerm("lk", lik, Spectrum)])
+    posterior = model.with_data(model.simulate(truth, rng))
+
+These methods take one point, ``theta`` of shape ``(ndim,)``, or a batch of points,
 of shape ``(n, ndim)``. A batch is evaluated with :meth:`~yabf.pipeline.Pipeline.batch`:
 stages that declare ``batched = True`` see the whole batch at once, and the others
 are called once per point. Both give the same results.
@@ -27,7 +33,6 @@ are called once per point. Both give the same results.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from functools import cached_property
 
 import attrs
 import numpy as np
@@ -36,7 +41,7 @@ from numpy.typing import ArrayLike
 from .likelihoods import Likelihood, ParametrisedLikelihood
 from .params import DerivedParam, Param, ParamSpace
 from .pipeline import Output, Pipeline
-from .stages import All, One, ParamSpec, Stage, call_stage
+from .stages import One, ParamSpec, Stage
 
 
 class LogLikelihood(float):
@@ -59,6 +64,21 @@ def _as_outputs(outputs: Iterable[Sequence[str]]) -> tuple[Output, ...]:
     return tuple((stage, output) for stage, output in outputs)
 
 
+def _spread(values: np.ndarray | None, inside: np.ndarray) -> np.ndarray:
+    """Place the values at the points ``inside`` among all the points of a batch.
+
+    The other points get NaN if the values are numeric, and None otherwise.
+    """
+    shape = (len(inside), *(() if values is None else values.shape[1:]))
+    if values is not None and values.dtype.kind in "fc":
+        out = np.full(shape, np.nan, dtype=values.dtype)
+    else:
+        out = np.full(shape, None, dtype=object)
+    if values is not None:
+        out[inside] = values
+    return out
+
+
 def _as_model(model: One | type) -> One:
     """Return the requirement for the scored model; a type is the output "model"."""
     if isinstance(model, One):
@@ -68,37 +88,18 @@ def _as_model(model: One | type) -> One:
     raise TypeError(f"The model to score must be a type or One(...), got {model!r}.")
 
 
-def _forward_stage(inst: LikelihoodTerm, att: attrs.Attribute, value: tuple) -> None:
-    """Check that each forward stage maps the term's model to a model of its type."""
-    model = inst.model.type
-    for stage in value:
-        need, give = [*stage.requires.values()], [*stage.provides.values()]
-        if len(need) != 1 or len(give) != 1 or isinstance(need[0], All):
-            raise ValueError(
-                f"Forward stage {stage.name!r} of {inst.name!r} must take one input "
-                "and provide one output, the model before and after it."
-            )
-        need = need[0] if isinstance(need[0], type) else need[0].type
-        give = give[0]
-        if not (issubclass(model, need) and issubclass(give, model)):
-            raise TypeError(
-                f"Forward stage {stage.name!r} of {inst.name!r} maps a "
-                f"{need.__qualname__} to a {give.__qualname__}, but the model it "
-                f"forwards is a {model.__qualname__}."
-            )
-
-
 @attrs.frozen(eq=False)
 class LikelihoodTerm:
     """A stage that scores one model output against data with a likelihood.
 
-    It takes the model output to score, passes it through the ``forward`` stages in
-    order (instrument effects, such as a window function, applied for this data alone),
-    and provides the log-likelihood of ``data`` given the result as ``"lnl"``. The
-    model as scored is also provided, as ``"scored"``.
+    It requires the model output to score, and provides the log-likelihood of ``data``
+    given it, as ``"lnl"``. Instrument effects, such as a gain or a window function,
+    are stages of the graph like any other: a term scores their output by asking for
+    it by name. Several terms can score different outputs of one model run, each
+    computed once.
 
-    Because the forward stages run inside the term, several terms can apply their own
-    instrument effects to one shared model output without competing to provide it.
+    The data may be left out, to simulate mock data first: without data, the
+    log-likelihood is NaN. Add the data with :meth:`Posterior.with_data`.
 
     Parameters
     ----------
@@ -108,46 +109,26 @@ class LikelihoodTerm:
         The likelihood, from :mod:`yabf.likelihoods` or any with the same interface.
         If it has parameters of its own (``parameters`` and ``with_params``), the term
         takes them and passes them on.
-    data
-        The data, as values or an object with ``values``.
     model
         The model output to score: a type, for the output of that type named
         ``"model"``, or a :class:`~yabf.stages.One`, such as ``One(Spectrum,
         name="sky")``.
-    forward
-        Stages applied to the model before scoring, each taking one input that
-        accepts the model's type and providing one output of that type (or a
-        subclass).
+    data
+        The data, as values or an object with ``values``, or None if there are no
+        data yet.
     """
 
     name: str
     likelihood: Likelihood
-    data: object
     model: One = attrs.field(converter=_as_model)
-    forward: tuple[Stage, ...] = attrs.field(
-        factory=tuple, converter=tuple, validator=_forward_stage, kw_only=True
-    )
+    data: object = attrs.field(default=None, kw_only=True)
 
-    def __attrs_post_init__(self) -> None:
-        """Check that stages sharing a parameter agree on what it accepts."""
-        _ = self.parameters
-
-    @cached_property
+    @property
     def parameters(self) -> Mapping[str, ParamSpec]:
-        """The parameters of the forward stages and of the likelihood."""
-        sources = [*self.forward]
+        """The parameters of the likelihood, if it has any."""
         if isinstance(self.likelihood, ParametrisedLikelihood):
-            sources.append(self.likelihood)
-        out: dict[str, ParamSpec] = {}
-        for source in sources:
-            for k, spec in source.parameters.items():
-                if k in out and out[k] != spec:
-                    raise ValueError(
-                        f"{self.name!r} takes {k!r} twice, with different specs: "
-                        f"{out[k]} and {spec}."
-                    )
-                out[k] = spec
-        return out
+            return self.likelihood.parameters
+        return {}
 
     @property
     def requires(self) -> dict[str, One]:
@@ -156,16 +137,8 @@ class LikelihoodTerm:
 
     @property
     def provides(self) -> dict[str, type]:
-        """The log-likelihood, and the model as scored."""
-        return {"lnl": LogLikelihood, "scored": self.model.type}
-
-    def forward_model(self, params: Mapping[str, object], model: object) -> object:
-        """Pass ``model`` through the forward stages, in order."""
-        for stage in self.forward:
-            (inp,) = stage.requires
-            (out,) = stage.provides
-            model = call_stage(stage, params, {inp: model})[out]
-        return model
+        """The log-likelihood."""
+        return {"lnl": LogLikelihood}
 
     def likelihood_at(self, params: Mapping[str, object]) -> Likelihood:
         """Return the likelihood at the values of its own parameters in ``params``."""
@@ -175,16 +148,12 @@ class LikelihoodTerm:
         return self.likelihood
 
     def compute(self, params: Mapping[str, object], model: object) -> dict:
-        """Forward the model, and score the data against it."""
-        model = self.forward_model(params, model)
-        lnl = self.likelihood_at(params).loglike(model, self.data)
-        return {"lnl": LogLikelihood(lnl), "scored": model}
-
-    def check(self, params: Mapping[str, object]) -> None:
-        """Run the checks of the forward stages that define one."""
-        for stage in self.forward:
-            if hasattr(stage, "check"):
-                stage.check({k: params[k] for k in stage.parameters})
+        """Score the data against the model; NaN if there are no data."""
+        if self.data is None:
+            return {"lnl": LogLikelihood(np.nan)}
+        return {
+            "lnl": LogLikelihood(self.likelihood_at(params).loglike(model, self.data))
+        }
 
     def parameter_values(self, params: Mapping[str, object]) -> dict[str, object]:
         """Return the values of the term's parameters: from ``params``, or defaults."""
@@ -296,6 +265,12 @@ class Posterior:
         point, and each blob an array stacking its values over the points.
         """
         theta = self._check_theta(theta)
+        missing = [t.name for t in self.likelihoods if t.data is None]
+        if missing:
+            raise ValueError(
+                f"The likelihood terms {missing} have no data. Add it with "
+                "with_data, for example from simulate."
+            )
         out = self.forward(theta, self.loglike_outputs + self.derived)
         if theta.ndim == 1:
             return (
@@ -306,10 +281,50 @@ class Posterior:
         lnl = np.sum(terms, axis=0)
         return lnl, {d: np.asarray(out[d]) for d in self.derived}
 
+    def log_posterior(
+        self, theta: ArrayLike
+    ) -> tuple[float | np.ndarray, dict[Output, object]]:
+        """Return the log posterior at ``theta``, up to a constant, and the blobs.
+
+        The log posterior is the log prior plus the log-likelihood. Outside the prior
+        it is ``-inf``, and the likelihood is not computed there: the blobs of such a
+        point are None, or NaN for numeric blobs of a batch. For a batch of points,
+        the log posterior and each blob have one value per point, as for
+        :meth:`log_likelihood`.
+        """
+        theta = self._check_theta(theta)
+        lp = np.array(self.log_prior(theta), dtype=float)
+        inside = lp > -np.inf
+        if theta.ndim == 1:
+            if not inside:
+                return -np.inf, dict.fromkeys(self.derived)
+            lnl, blobs = self.log_likelihood(theta)
+            return float(lp) + lnl, blobs
+        blobs = {}
+        if inside.any():
+            lnl, blobs = self.log_likelihood(theta[inside])
+            lp[inside] += lnl
+        return lp, {d: _spread(blobs.get(d), inside) for d in self.derived}
+
+    def with_data(self, data: Mapping[str, object]) -> Posterior:
+        """Return this posterior with new data for its likelihood terms, by name.
+
+        ``data`` maps the names of terms in ``likelihoods`` to their data, as
+        :meth:`simulate` returns them; terms left out keep their data.
+        """
+        unknown = sorted(set(data) - {t.name for t in self.likelihoods})
+        if unknown:
+            raise ValueError(f"The posterior has no likelihood terms named {unknown}.")
+        terms = [
+            attrs.evolve(t, data=data[t.name]) if t.name in data else t
+            for t in self.likelihoods
+        ]
+        return attrs.evolve(self, likelihoods=terms)
+
     def simulate(self, theta: ArrayLike, rng: np.random.Generator) -> dict[str, object]:
         """Draw mock data at one point ``theta``, for each likelihood term, by name.
 
-        Each term's likelihood draws data from the model it would score, so a mock is
+        Each term's likelihood draws data from the output it scores, so a mock is
         distributed as the likelihood assumes. Randomness inside the forward model,
         such as a simulator's seed, is not redrawn: it is set by the parameters (see
         :attr:`random_inputs`).
@@ -317,13 +332,23 @@ class Posterior:
         theta = self._check_theta(theta)
         if theta.ndim != 1:
             raise ValueError("simulate draws mock data at one point at a time.")
-        models = self.forward(theta, [(t.name, "scored") for t in self.likelihoods])
+        scored = self.scored
+        models = self.forward(theta, scored.values())
         params = self.params.to_model(theta)
         return {
             t.name: t.likelihood_at(t.parameter_values(params)).simulate(
-                models[t.name, "scored"], rng
+                models[scored[t.name]], rng
             )
             for t in self.likelihoods
+        }
+
+    @property
+    def scored(self) -> dict[str, Output]:
+        """The output each likelihood term scores, as a ``(stage, output)`` pair."""
+        return {
+            link.stage: (link.provider, link.output)
+            for link in self.pipeline.graph.links
+            if link.stage in {t.name for t in self.likelihoods}
         }
 
     @property
