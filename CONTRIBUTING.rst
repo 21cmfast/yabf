@@ -115,8 +115,22 @@ Before you submit a pull request, check that it meets these guidelines:
     $ uv run sphinx-build -b html docs docs/_build/html
 3. The pull request should pass CI on all supported Python versions (3.12+).
 
-Tips
-----
+Tests
+-----
+
+Every test runs on every push, in seconds, without any simulator installed:
+
+- **Unit and contract tests** check each prior, stage, likelihood and observable in
+  isolation, against a closed form or a library such as ``scipy.stats`` where one
+  exists. :func:`yabf.testing.assert_stage_contract` checks that a stage keeps the
+  stage protocol.
+- **Pipeline and sampler tests** run whole posteriors whose answer is known exactly,
+  from :mod:`yabf.testing`: a correlated Gaussian, a bimodal mixture, and a toy
+  simulator chain (a seeded "lightcone" and its average). A sampler passes if it
+  recovers their moments within Monte Carlo error.
+
+CI also checks that the v3 core (``params``, ``priors``, ``stages``, ``pipeline``,
+``posterior``, ``likelihoods`` and ``testing``) stays at least 90% covered.
 
 To run a subset of tests::
 
