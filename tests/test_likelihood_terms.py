@@ -11,7 +11,7 @@ from yabf import priors
 from yabf.likelihoods import Gaussian
 from yabf.params import Param, param_vector
 from yabf.posterior import LikelihoodTerm, Posterior
-from yabf.stages import REQUIRED, All, GraphError, ParamSpec
+from yabf.stages import REQUIRED, All, GraphError, One, ParamSpec
 
 X = np.linspace(-1.0, 1.0, 6)
 COV = np.diag(np.full(X.size, 0.3**2)) + 0.01
@@ -264,6 +264,40 @@ class TwoInputs:
 def test_malformed_terms_are_rejected(forward, error, match):
     with pytest.raises(error, match=match):
         LikelihoodTerm("lk", Gaussian(COV), DATA, Curve, forward=forward)
+
+
+@attrs.frozen(eq=False)
+class Shift:
+    """A stage providing the model shifted by a constant, under another name."""
+
+    name: str = "shift"
+    parameters: ClassVar = {}
+    requires: ClassVar = {"model": Curve}
+    provides: ClassVar = {"shifted": Curve}
+
+    def compute(self, params, model):
+        return {"shifted": Curve(model.values + 0.25)}
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [(Curve, 0.0), (One(Curve, name="shifted"), 0.25)],
+    ids=["model", "named"],
+)
+def test_a_term_scores_the_output_it_names(model, expected):
+    """With two curves in the graph, a term scores the one it asks for by name."""
+    post = Posterior(
+        BETA,
+        [Line(), Shift()],
+        likelihoods=[LikelihoodTerm("lk", Gaussian(COV), DATA, model)],
+    )
+    lnl, _ = post.log_likelihood([0.1, 0.7])
+    np.testing.assert_allclose(lnl, mvn(0.1 + 0.7 * X + expected), rtol=1e-12)
+
+
+def test_the_model_to_score_must_be_a_requirement():
+    with pytest.raises(TypeError, match="must be a type or One"):
+        LikelihoodTerm("lk", Gaussian(COV), DATA, "model")
 
 
 def test_mocks_are_drawn_one_point_at_a_time():
