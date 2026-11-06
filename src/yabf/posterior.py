@@ -330,25 +330,25 @@ class Posterior:
     def random_inputs(self) -> dict[str, str]:
         """How each random input of a stage is set, by name.
 
-        Each is ``"sampled"``, ``"fixed"``, ``"tied"`` or ``"default"``. An input is
-        random when a stage's :class:`~yabf.stages.ParamSpec` says so, as for a
+        Each is ``"sampled"``, ``"fixed"``, ``"derived"`` or ``"default"``. An input
+        is random when a stage's :class:`~yabf.stages.ParamSpec` says so, as for a
         simulator's seed. Leaving it at its default or fixing it conditions the
         posterior on one realisation; sampling it treats the realisation as noise.
         """
-        by_feeds = {p.feeds: p for p in self.params.params}
+        by_name = {p.name: p for p in self.params.params}
         out = {}
         for stage in self.pipeline.graph.stages:
             for k, spec in stage.parameters.items():
                 if spec.random:
-                    p = by_feeds.get(k)
+                    p = by_name.get(k)
                     out[k] = (
                         "default"
                         if p is None
+                        else "derived"
+                        if isinstance(p, DerivedParam)
                         else "sampled"
                         if p.is_sampled
                         else "fixed"
-                        if p.is_fixed
-                        else "tied"
                     )
         return out
 
