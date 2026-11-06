@@ -6,10 +6,11 @@ kernelspec:
 
 # Posteriors, likelihoods and mock data
 
-A {class}`~yabf.posterior.Posterior` joins a parameter space to a graph of stages, and
-scores the model's outputs against data. In this tutorial we draw a mock measurement
-of the global 21-cm signal, recover the trough from it with an MCMC sampler, and
-check that its posterior covers the truth.
+In this tutorial we put the pieces of the previous two together into an inference.
+We draw a mock measurement of the global 21-cm signal, recover the trough from it with
+an MCMC sampler, and check that the posterior covers the true values. The object that
+ties everything together is the {class}`~yabf.posterior.Posterior`: it joins a
+parameter space to a graph of stages, and scores the model's outputs against data.
 
 ```{code-cell} python
 from collections.abc import Mapping
@@ -31,8 +32,9 @@ rng = np.random.default_rng(2024)
 getdist.chains.print_load_details = False
 ```
 
-We use the stages of the previous tutorial: a power-law foreground and a Gaussian
-absorption trough, summed into the sky spectrum, and an instrument gain.
+We reuse the stages of the previous tutorial: a power-law foreground and a Gaussian
+absorption trough, summed into the sky spectrum, and an instrument gain. Their code is
+the same as there; click below to show it.
 
 ```{code-cell} python
 :tags: [hide-input]
@@ -121,23 +123,29 @@ class Gain:
 
 ## Likelihood terms
 
-A likelihood is a model of the noise. It gives two things, one distribution of the
-data given the model: `loglike(model, data)`, the log probability density of the
-data, and `simulate(model, rng)`, a draw of data from that same distribution. Mock
-data and inference therefore cannot disagree about the noise.
+To compare the model with data, we need a likelihood: a model of the noise in the
+measurement. In `yabf`, a likelihood provides two things, both describing one
+distribution of the data given the model: `loglike(model, data)`, the log probability
+density of the data, and `simulate(model, rng)`, a draw of data from that same
+distribution. Because both come from one place, mock data and inference cannot
+disagree about the noise.
 
-{mod}`yabf.likelihoods` has generic likelihoods: Gaussian, Student's t, Poisson,
-upper limits, asymmetric errors and tabulated distributions. A radiometer with 50 mK
-of independent Gaussian noise per channel is
+{mod}`yabf.likelihoods` has generic likelihoods for the common cases: Gaussian,
+Student's t, Poisson, upper limits, asymmetric errors and tabulated distributions. Our
+radiometer has 50 mK of independent Gaussian noise in each channel, so we use a
+Gaussian with that standard deviation:
 
 ```{code-cell} python
 SIGMA = 0.05  # K
 radiometer = Gaussian.from_sigma(np.full(NU.size, SIGMA))
 ```
 
-A {class}`~yabf.posterior.LikelihoodTerm` scores one model output against data with a
-likelihood. It takes the output to score as a requirement, here the `Spectrum` named
-`"sky"`. Together with the parameters and stages, it makes a posterior:
+Next, we need to say which model output the likelihood should score, and against
+which data. A {class}`~yabf.posterior.LikelihoodTerm` does this: it is a stage that
+takes one model output, here the `Spectrum` named `"sky"`, and scores the data against
+it with the likelihood. Together with the parameters and the stages, the terms make a
+posterior. Since we will build several posteriors below, we write a small function
+that makes one from a measured spectrum:
 
 ```{code-cell} python
 params = [
@@ -159,9 +167,11 @@ def posterior(data: np.ndarray) -> Posterior:
 
 ## Mock data
 
-`simulate` draws mock data at a point, from each term's likelihood, given the model
-that term would score. It does not look at the data, so a posterior built on a
-placeholder can make the mock:
+We do not have a real measurement, so we make a mock one, at known true values of the
+parameters. `posterior.simulate` does this: at a given point, it draws data from each
+term's likelihood, given the model that term would score. It does not look at the
+data, so we can build a posterior on a placeholder to make the mock, and then build
+the posterior we will sample on the mock itself:
 
 ```{code-cell} python
 truth = np.array([1000.0, -2.5, 0.5, 78.0, 5.0])
@@ -170,8 +180,8 @@ post = posterior(mock)
 post.names
 ```
 
-The trough is invisible under the foreground, but stands out once the true foreground
-is subtracted:
+Let us look at the mock. The trough is invisible under the foreground, but stands out
+once the true foreground is subtracted:
 
 ```{code-cell} python
 out = post.forward(truth)
@@ -189,9 +199,9 @@ bottom.legend();
 
 ## The log-likelihood
 
-`log_likelihood` returns the log-likelihood, and the outputs listed as `derived` when
-the posterior was made, as blobs. It takes one point, or a batch of points, one per
-row:
+With data and a posterior, we can score any point of the parameter space.
+`log_likelihood` returns the log-likelihood, along with any outputs listed as
+`derived` when the posterior was made (here none), as blobs. At the true values:
 
 ```{code-cell} python
 lnl, blobs = post.log_likelihood(truth)
@@ -203,13 +213,16 @@ draws = post.params.sample_prior(4, rng)
 post.log_likelihood(draws)[0]
 ```
 
-Points drawn from the prior fit the data very badly, which is why we need a sampler.
+It also takes a batch of points, one per row. Points drawn from the prior fit the
+data very badly, which is why we need a sampler to find the region of good fits.
 
 ## Sampling the posterior
 
-A posterior gives a sampler what it needs: `ndim`, `names`, `log_prior`,
-`prior_transform` and `log_likelihood`. Here we use [emcee](https://emcee.readthedocs.io),
-which calls the log posterior on all its walkers at once:
+We now explore the posterior with a sampler. A posterior gives a sampler what it
+needs: `ndim`, `names`, `log_prior`, `prior_transform` and `log_likelihood`. Here we
+use [emcee](https://emcee.readthedocs.io), an MCMC sampler. It needs one function,
+the log posterior, which we write from the log prior and the log-likelihood. emcee can
+call it on all its walkers at once, which `yabf` evaluates as a batch:
 
 ```{code-cell} python
 def log_posterior(theta: np.ndarray) -> np.ndarray:
@@ -233,7 +246,8 @@ Starting the walkers near the truth makes them converge quickly. With real data 
 truth is unknown: start them across the prior, for example with
 `post.params.sample_prior`, and run until the chains have converged.
 
-The posterior covers the true values, marked by the dotted lines:
+To see the result, we plot the samples as a corner plot. The posterior covers the true
+values, marked by the dotted lines:
 
 ```{code-cell} python
 samples = MCSamples(
@@ -251,10 +265,12 @@ for name, mean, std, true in zip(post.names, chain.mean(0), chain.std(0), truth)
     print(f"{name:>8}: {mean:.6g} ± {std:.2g}   (truth {true:g})")
 ```
 
-The foreground, being so bright, is measured far more precisely than the trough.
+The mean of each parameter is within about one standard deviation of the truth. The
+foreground, being so bright, is measured far more precisely than the trough.
 
-Running the posterior's stages at points drawn from it shows the range of signals
-the data allow:
+Finally, to see what the posterior means for the signal itself, we run the model at
+100 points drawn from it, and plot the trough at each. Together they show the range
+of signals the data allow:
 
 ```{code-cell} python
 fig, ax = plt.subplots(figsize=(6, 3.5))
@@ -268,10 +284,15 @@ ax.legend();
 
 ## Several data sets
 
-A likelihood term can apply instrument effects of its own before scoring the model,
-in its `forward` stages. Two instruments measuring the same sky, one of them with an
-uncertain gain, are two terms scoring one shared sky spectrum. The sky is computed
-once for both, and each term provides the model it scored as its output `"scored"`:
+Real analyses often combine several measurements of the same thing, each made with its
+own instrument. Here we add a second radiometer, twice as noisy, whose gain is
+uncertain. Both measure the same sky, so the sky should be computed once, and only the
+instrument effect should differ between them.
+
+A likelihood term can apply instrument effects of its own before scoring the model, in
+its `forward` stages. So the two measurements are two terms scoring one shared sky
+spectrum, the second through its own gain stage. Each term provides the model it
+scored as its output `"scored"`:
 
 ```{code-cell} python
 second = Gaussian.from_sigma(np.full(NU.size, 2 * SIGMA))
@@ -309,10 +330,11 @@ two.loglike_outputs, two.log_likelihood(theta)[0]
 
 ## Likelihoods with parameters of their own
 
-The noise level of a measurement is not always known. A likelihood can have
-parameters of its own: it declares them in `parameters`, like a stage, and `with_params`
-returns the likelihood at given values. Here the noise of each channel is an unknown
-`noise` in K:
+The noise level of a measurement is not always known, and then it has to be fitted
+along with the model. To allow this, a likelihood can have parameters of its own. It
+declares them in `parameters`, like a stage, and its `with_params` method returns the
+likelihood at given values of them. Here we write a Gaussian likelihood whose noise
+level, the same in every channel, is an unknown parameter `noise`, in K:
 
 ```{code-cell} python
 @attrs.frozen
@@ -369,9 +391,12 @@ print(f"RMS of the residuals: {np.sqrt(np.mean(residual**2)) * 1e3:.1f} mK")
 
 ## Random inputs
 
-A simulator that draws random numbers, such as initial conditions, makes its output
-depend on a seed. A stage marks such an input with `ParamSpec(..., random=True)`, and
-the posterior reports how each one is set:
+Finally, some models are random themselves. A simulator that draws random numbers,
+such as initial conditions, makes its output depend on a seed. How the seed is set
+changes what the posterior means, so `yabf` asks you to be explicit about it. A stage
+marks such an input with `ParamSpec(..., random=True)`, and the posterior reports how
+each one is set. Here a foreground with a random ripple stands in for such a
+simulator:
 
 ```{code-cell} python
 @attrs.frozen

@@ -6,15 +6,26 @@ kernelspec:
 
 # Parameters and priors
 
-An inference has two kinds of parameters. The *sampled* parameters are what a sampler
-explores, each with a prior. The *model* parameters are what the model computes with.
-Often they are the same, but not always: it is easier to sample an amplitude
-spanning decades in its logarithm, some model parameters are held fixed, and some are
-computed from others.
+Every model in `yabf` declares the parameters it needs in order to compute. In these
+tutorials, for example, the foreground of the sky spectrum needs an amplitude and a
+spectral index, and the 21-cm absorption trough needs a depth, a centre and a width.
+We call these the *model parameters*.
 
-yabf describes each sampled, fixed or computed parameter with a {class}`~yabf.params.Param`,
-and collects them in a {class}`~yabf.params.ParamSpace`, which gives a sampler
-everything it needs.
+When you set up an inference, you decide where each model parameter gets its value.
+Most are explored by a sampler, each within a prior. But the parameters the sampler
+explores need not be exactly the parameters the model asks for: you can provide any
+set of parameters, as long as they are ultimately turned into the ones the model
+requests.
+
+So user-defined parameters need not always be sampled from a prior directly. They can
+be sampled in one space and transformed to another (for example, sampled uniformly in
+log-space and transformed to linear space). They can be fixed to a specific value
+rather than sampled, or they can be computed deterministically from other parameters.
+
+In `yabf`, you define each input parameter as a {class}`~yabf.params.Param`. The
+collection of all parameters is defined as a {class}`~yabf.params.ParamSpace`, which
+supplies the extra methods that tie everything together. This tutorial walks through
+each kind of parameter in turn, and then shows how the parameter space combines them.
 
 ```{code-cell} python
 import getdist
@@ -31,19 +42,25 @@ getdist.chains.print_load_details = False
 
 ## Sampled parameters and their priors
 
-A sampled parameter needs a name and a prior. A `(low, high)` tuple is a uniform
-prior:
+The most common kind of parameter is one that the sampler explores directly, within a
+prior. To define one, give it a name, which must match the name of the model
+parameter it provides, and a prior. The simplest prior is uniform between two values,
+which you can give as a `(low, high)` tuple. Here is the depth of the absorption
+trough, between 0 and 2 K:
 
 ```{code-cell} python
 depth = Param("depth", prior=(0.0, 2.0), latex="A")
 depth.fiducial
 ```
 
-The *fiducial* value, where a sampler can start, defaults to the median of the prior.
+The *fiducial* value defaults to the median of the prior, and influences where a
+sampler initializes its samples. It can also be used as a simple default parameter
+set when exploring the posterior. The `latex` label is used when plotting.
 
-A prior is anything with vectorised `logpdf` and `ppf` (the inverse of the cumulative
-distribution) methods, so every frozen {mod}`scipy.stats` distribution works. The
-{mod}`yabf.priors` module has short names for the common ones:
+Uniform priors are not the only option. A prior is anything with vectorised `logpdf`
+and `ppf` (the inverse of the cumulative distribution) methods, so every frozen
+{mod}`scipy.stats` distribution works automatically. The {mod}`yabf.priors` module has
+short names for the common ones. Here they are, side by side:
 
 ```{code-cell} python
 examples = {
@@ -62,12 +79,15 @@ ax.set_ylabel("prior density")
 ax.legend();
 ```
 
-## Sampling in a different space
+## Sampling in a different space: using parameter transforms
 
 The foreground of the sky spectrum is a power law whose amplitude we only know to an
-order of magnitude. Sampling its logarithm uniformly is the natural choice, but the
-model needs the amplitude itself. A parameter can *feed* a model parameter of
-another name, through a named transform:
+order of magnitude. Instead of sampling the amplitude directly, it is more natural to
+sample in log-space. To achieve this in `yabf`, the simplest way is to specify the
+`feeds` and `transform` options to `Param`. Setting `transform` to `pow10` tells
+`yabf` to raise 10 to the power of the sampled (log-space) parameter, and `feeds` tells
+it the name of the transformed parameter, which in this case is going to match the
+input parameter name for our model, `fg_amp`:
 
 ```{code-cell} python
 log_amp = Param(
@@ -80,21 +100,32 @@ log_amp = Param(
 log_amp.to_model(3.0)
 ```
 
-The built-in transforms are `identity`, `pow10`, `log10`, `exp` and `log`;
-{func}`~yabf.params.register_transform` adds more. Transforms are referred to by name
-so that a parameter space can be written to a configuration file and read back.
+The sampler now explores `log10_fg_amp`, uniformly between 2 and 4, and `to_model`
+shows the value the model receives: a sampled value of 3 becomes an amplitude of 1000.
+
+The built-in transforms are `identity`, `pow10`, `log10`, `exp` and `log`. You can
+define your own with {func}`~yabf.params.register_transform`, giving it a name, the
+function and its inverse. Transforms are referred to by their string name, which means
+they can be used in static configuration files, as long as they are registered.
 
 ## Fixed and tied parameters
 
-A fixed parameter always takes the same value; the sampler never sees it:
+Not every model parameter needs to be explored. Sometimes you want to hold one at a
+known value: the spectral index of the foreground, say, if it is already well
+measured. To fix a parameter to a specific value, instead of sampling it, set the
+`fixed=` option:
 
 ```{code-cell} python
 index = Param("fg_index", fixed=-2.5)
 ```
 
-A *tied* parameter is computed from other model parameters. 21cmFAST, for instance,
-can describe star formation in minihaloes with parameters that default to those of
-atomic-cooling haloes:
+The sampler never sees a fixed parameter, but the model still receives its value.
+
+Other parameters are not free at all, but follow from the values of others. 21cmFAST,
+for instance, describes star formation in minihaloes with parameters that, by default,
+follow those of atomic-cooling haloes. To express this, *tie* the parameter to the
+others with the `tied=` option. A dictionary of coefficients ties it to a linear
+combination of other parameters, and a single name ties it to that parameter's value:
 
 ```{code-cell} python
 f_star10 = Param("F_STAR10", prior=(-3.0, -0.5), latex=r"\log_{10} f_{*,10}")
@@ -103,15 +134,18 @@ f_star7 = Param("F_STAR7_MINI", tied={"F_STAR10": 1, "ALPHA_STAR": -3})
 alpha_mini = Param("ALPHA_STAR_MINI", tied="ALPHA_STAR")
 ```
 
-A dictionary ties a parameter to a linear combination of others, here
-`F_STAR7_MINI = F_STAR10 - 3 ALPHA_STAR`, and a name ties it to that parameter's value.
-Other relations can be added with {func}`~yabf.params.register_relation`.
+Here `F_STAR7_MINI = F_STAR10 - 3 ALPHA_STAR`, and `ALPHA_STAR_MINI = ALPHA_STAR`.
+Like fixed parameters, tied ones are not sampled. Other relations can be added with
+{func}`~yabf.params.register_relation`.
 
 ## Vector parameters
 
-Some models take a vector, such as the coefficients of a polynomial.
-{func}`~yabf.params.param_vector` makes one parameter per element, which the sampler
-sees as scalars, and the model receives as one array. Elements can be fixed:
+Some models take a whole vector of parameters, such as the coefficients of a
+polynomial. Rather than writing a `Param` for each element, use
+{func}`~yabf.params.param_vector`. It makes one parameter per element, which the
+sampler sees as separate scalars, and the model receives as one array. As for single
+parameters, elements can be fixed. Here is a vector of three coefficients, with the
+last one held at zero:
 
 ```{code-cell} python
 beta = param_vector(
@@ -122,10 +156,11 @@ beta = param_vector(
 
 ## Joint priors
 
-Parameters can also share a prior. A correlated Gaussian prior on the centre and width
-of the absorption trough, as might come from an earlier measurement, is a
-{func}`~yabf.priors.multivariate_normal`, and each parameter takes its
-{class}`~yabf.priors.Marginal`:
+Sometimes parameters are not independent before we see the data. An earlier
+measurement may have constrained the centre and width of the absorption trough
+together, with correlated errors. To express this, define their joint prior, here a
+correlated Gaussian with {func}`~yabf.priors.multivariate_normal`, and give each
+parameter its {class}`~yabf.priors.Marginal`:
 
 ```{code-cell} python
 measured = priors.multivariate_normal(mean=[78.0, 5.0], cov=[[4.0, 1.5], [1.5, 1.0]])
@@ -135,14 +170,26 @@ trough = [
 ]
 ```
 
-The parameter space draws them together, from the joint prior. A whole vector can
-take a joint prior too, with `param_vector(..., prior=measured)`.
+The marginal is not what each parameter is drawn from. It describes the parameter on
+its own, which is what `yabf` needs for everything that concerns one parameter: its
+fiducial value (the median of the marginal), the width of a ball of starting points,
+and checking its range against what the model accepts. When it draws samples, or
+computes the prior density, the parameter space recognises that the parameters share
+a joint prior, and treats them together. It maps the unit hypercube onto the joint
+distribution as `mean + L z`, with `L` the lower-triangular Cholesky factor of the
+covariance and `z` standard normal: the first parameter from its marginal, the second
+from its distribution conditional on the first, and so on. The correlation is kept, as
+the plot at the end of this tutorial shows.
+
+A whole vector can take a joint prior too, with `param_vector(..., prior=measured)`.
 
 ## The parameter space
 
-A {class}`~yabf.params.ParamSpace` collects the parameters. It checks that they are
-consistent (that ties refer to parameters it contains, without cycles, and that each
-vector is complete) and orders the sampled ones:
+Once each parameter is defined, collect them all in a
+{class}`~yabf.params.ParamSpace`. This is the object that the rest of `yabf`, and the
+samplers, work with. When you build it, it checks that the parameters are consistent:
+that ties refer to parameters it contains, without cycles, and that each vector is
+complete. It also puts the sampled parameters in a fixed order:
 
 ```{code-cell} python
 space = ParamSpace(
@@ -151,9 +198,14 @@ space = ParamSpace(
 space.names
 ```
 
-It provides what samplers need, for one point or many at once: the map from the
-unit hypercube that nested samplers use, the log prior density, draws from the prior
-and a small ball of starting points around the fiducial values for MCMC walkers.
+Of the eleven parameters, seven are sampled: the fixed and tied ones are not, and
+neither is the fixed element of `beta`.
+
+The parameter space provides what samplers need, for one point or many at once: the
+map from the unit hypercube that nested samplers use, the log prior density, draws
+from the prior, and a small ball of starting points around the fiducial values for
+MCMC walkers. For example, mapping three points of the unit hypercube to the
+parameters, and evaluating their prior density:
 
 ```{code-cell} python
 u = rng.uniform(size=(3, space.ndim))
@@ -161,8 +213,9 @@ theta = space.prior_transform(u)
 space.log_prior(theta)
 ```
 
-`to_model` turns sampled values into the model parameters: it applies transforms,
-inserts fixed values, assembles vectors and computes tied parameters.
+The last step is to turn the sampled values into the model parameters, which is what
+`to_model` does. It applies the transforms, inserts the fixed values, assembles the
+vectors and computes the tied parameters:
 
 ```{code-cell} python
 model = space.to_model(theta[0])
@@ -194,3 +247,5 @@ ax.scatter(values["F_STAR10"] - 3 * values["ALPHA_STAR"], values["F_STAR7_MINI"]
 ax.set_xlabel(r"$\log_{10} f_{*,10} - 3\alpha_*$")
 ax.set_ylabel(r"$\log_{10} f_{*,7}^{\rm mini}$");
 ```
+
+The next tutorial builds the model that these parameters feed.
