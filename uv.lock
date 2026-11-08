@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12"
 
 [[package]]
@@ -1700,6 +1700,7 @@ wheels = [
 name = "yabf"
 source = { editable = "." }
 dependencies = [
+    { name = "attrs" },
     { name = "click" },
     { name = "emcee" },
     { name = "frozendict" },
@@ -1736,6 +1737,7 @@ tests = [
 
 [package.metadata]
 requires-dist = [
+    { name = "attrs", specifier = ">=23.1" },
     { name = "click", specifier = ">=6.0" },
     { name = "emcee" },
     { name = "frozendict" },
