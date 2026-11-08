@@ -40,3 +40,9 @@ Sampling
 
 .. automodule:: yabf.sampling
    :members:
+
+CosmoSIS
+--------
+
+.. automodule:: yabf.cosmosis
+   :members: run, dry_run, read_chain, build_pipeline, DryRunReport

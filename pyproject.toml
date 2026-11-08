@@ -54,6 +54,12 @@ samplers = [
 ]
 # Samples.to_arviz.
 arviz = ["arviz-base>=1.3"]
+# yabf.cosmosis. Building CosmoSIS needs a Fortran compiler; set MPIFC=mpif90 when
+# installing it to build its samplers with MPI.
+cosmosis = [
+    "cosmosis>=3.26",
+    "mpi4py>=4.0",
+]
 
 [dependency-groups]
 docs = [
@@ -62,8 +68,9 @@ docs = [
     "ipykernel>=6.29",
     "myst-nb>=1.3",
     "numpydoc>=1.10.0",
-    # The tutorials run the samplers, and check them with ArviZ.
+    # The tutorials run the samplers, through CosmoSIS too, and check them with ArviZ.
     "arviz>=1.3",
+    "cosmosis>=3.26",
     "h5py>=3.10",
     "nautilus-sampler>=1.0.6",
 ]
