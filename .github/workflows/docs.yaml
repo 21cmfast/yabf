@@ -27,6 +27,9 @@ jobs:
         with:
           compiler: gcc
           version: 13
+      - name: Install LAPACK
+        # CosmoSIS builds MultiNest, which links to LAPACK.
+        run: sudo apt-get update && sudo apt-get install -y liblapack-dev
       - name: Install
         run: pip install . --group docs
       - name: Build
