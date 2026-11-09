@@ -247,14 +247,21 @@ def test_the_model_to_score_must_be_a_requirement():
         LikelihoodTerm("lk", Gaussian(COV), "model", data=DATA)
 
 
-def test_mocks_are_drawn_one_point_at_a_time():
+def test_a_batch_draws_each_mock_at_its_own_point():
+    """Mocks at prior draws of the line and of a noise amplitude: each residual about
+    its own point's model, in units of its own noise, gives r C^-1 r / noise^2
+    distributed as chi-squared with one degree of freedom per value."""
+    term = LikelihoodTerm("lk", ScaledGaussian(COV), Curve)
     post = Posterior(
-        BETA,
-        [Line()],
-        likelihoods=[LikelihoodTerm("lk", Gaussian(COV), Curve, data=DATA)],
+        [*BETA, Param("noise", prior=(0.1, 5.0))], [Line()], likelihoods=[term]
     )
-    with pytest.raises(ValueError, match="one point"):
-        post.simulate(np.zeros((3, 2)), np.random.default_rng(3))
+    rng = np.random.default_rng(3)
+    theta = post.params.sample_prior(2000, rng)
+    mocks = post.simulate(theta, rng)["lk"]
+    assert mocks.shape == (len(theta), X.size)
+    r = mocks - (theta[:, :1] + theta[:, 1:2] * X)
+    chi2 = np.einsum("ni,ij,nj->n", r, np.linalg.inv(COV), r) / theta[:, 2] ** 2
+    assert stats.kstest(chi2, stats.chi2(X.size).cdf).pvalue > 1e-3
 
 
 def _gained(line=None, **kwargs):

@@ -322,7 +322,13 @@ class Posterior:
         return attrs.evolve(self, likelihoods=terms)
 
     def simulate(self, theta: ArrayLike, rng: np.random.Generator) -> dict[str, object]:
-        """Draw mock data at one point ``theta``, for each likelihood term, by name.
+        """Draw mock data at ``theta``, for each likelihood term, by name.
+
+        ``theta`` is one point, of shape ``(ndim,)``, or a batch of shape
+        ``(n, ndim)``; for a batch, each term's data have a leading axis of length
+        ``n``, holding one independent draw per point. At a single true point a draw
+        is a mock data set; at points drawn from the prior or the posterior, the
+        draws are the prior or posterior predictive distribution of the data.
 
         Each term's likelihood draws data from the output it scores, so a mock is
         distributed as the likelihood assumes. Randomness inside the forward model,
@@ -330,11 +336,29 @@ class Posterior:
         :attr:`random_inputs`).
         """
         theta = self._check_theta(theta)
-        if theta.ndim != 1:
-            raise ValueError("simulate draws mock data at one point at a time.")
         scored = self.scored
         models = self.forward(theta, scored.values())
         params = self.params.to_model(theta)
+        if theta.ndim == 1:
+            return self._draw(models, params, rng)
+        draws = [
+            self._draw(
+                {k: v[i] for k, v in models.items()},
+                {k: v[i] for k, v in params.items()},
+                rng,
+            )
+            for i in range(len(theta))
+        ]
+        return {t.name: np.stack([d[t.name] for d in draws]) for t in self.likelihoods}
+
+    def _draw(
+        self,
+        models: Mapping[Output, object],
+        params: Mapping[str, object],
+        rng: np.random.Generator,
+    ) -> dict[str, object]:
+        """Draw one data set per term, from the models and parameters of one point."""
+        scored = self.scored
         return {
             t.name: t.likelihood_at(t.parameter_values(params)).simulate(
                 models[scored[t.name]], rng
