@@ -50,6 +50,11 @@ jobs:
       - name: Run Tests
         run: |
           python -m pytest --cov-report xml:./coverage.xml
+      - name: Coverage of the v3 core
+        # The generic v3 layer must stay at least 90% covered; the v2 modules are
+        # outside this gate.
+        run: |
+          python -m coverage report --fail-under=90 --include="*/yabf/params.py,*/yabf/priors.py,*/yabf/stages.py,*/yabf/pipeline.py,*/yabf/posterior.py,*/yabf/likelihoods.py,*/yabf/testing.py"
       - uses: codecov/codecov-action@v7
         with:
           fail_ci_if_error: true
