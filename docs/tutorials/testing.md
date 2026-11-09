@@ -53,8 +53,8 @@ start = post.params.gaussian_ball(nwalkers, rng, center=gaussian.truth.mean)
 sampler = emcee.EnsembleSampler(
     nwalkers, post.ndim, lambda theta: post.log_posterior(theta)[0], vectorize=True
 )
-sampler.run_mcmc(start, 3000, progress=False)
-chain = sampler.get_chain(discard=600, thin=10, flat=True)
+sampler.run_mcmc(start, 6000, progress=False)
+chain = sampler.get_chain(discard=1000, thin=10, flat=True)
 ```
 
 The samples should agree with exact draws from the truth, up to Monte Carlo error. A
@@ -78,8 +78,8 @@ deviation, and emcee estimates `n_eff` from the autocorrelation time. So the err
 each mean, in units of its standard error, should be of order one:
 
 ```{code-cell} python
-steps = sampler.get_chain(discard=600, flat=True)
-n_eff = len(steps) / sampler.get_autocorr_time(discard=600).max()
+steps = sampler.get_chain(discard=1000, flat=True)
+n_eff = len(steps) / sampler.get_autocorr_time(discard=1000).max()
 sd = np.sqrt(np.diag(gaussian.truth.covariance))
 (steps.mean(axis=0) - gaussian.truth.mean) / (sd / np.sqrt(n_eff))
 ```
