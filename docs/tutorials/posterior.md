@@ -201,6 +201,25 @@ bottom.set_ylabel("T [K]")
 bottom.legend();
 ```
 
+`simulate` also takes a batch of points, and draws one data set at each. At points
+drawn from the prior, the draws are the *prior predictive* distribution: the data the
+model expects before seeing any. Before fitting, it is worth checking that the
+measurement lies within it; if it did not, no values the prior allows could explain
+it. Here the mock lies well inside the range of the prior predictive data:
+
+```{code-cell} python
+prior_points = model.params.sample_prior(200, rng)
+predicted = model.simulate(prior_points, rng)["radiometer"]
+low, high = np.percentile(predicted, [2.5, 97.5], axis=0)
+
+fig, ax = plt.subplots(figsize=(6, 3.5))
+ax.fill_between(NU, low, high, alpha=0.3, label="95% of prior predictive data")
+ax.plot(NU, mock, ".", ms=3, label="mock")
+ax.set_xlabel(r"$\nu$ [MHz]")
+ax.set_ylabel("T [K]")
+ax.legend();
+```
+
 ## The log-likelihood
 
 With data and a posterior, we can score any point of the parameter space.
