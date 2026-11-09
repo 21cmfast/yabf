@@ -16,13 +16,13 @@ from collections.abc import Mapping
 from typing import ClassVar
 
 import attrs
-import emcee
 import getdist
 import matplotlib.pyplot as plt
 import numpy as np
 from getdist import MCSamples, plots
 
 from yabf import testing
+from yabf.sampling import run_emcee, run_nautilus
 from yabf.stages import ParamSpec
 
 rng = np.random.default_rng(1)
@@ -45,16 +45,11 @@ post.names, gaussian.truth.mean
 ```
 
 To check a sampler, we run it on the posterior and compare its samples with the truth.
-Here we use emcee, which samples `post.log_posterior`:
+Here we use emcee, through {func}`~yabf.sampling.run_emcee`:
 
 ```{code-cell} python
-nwalkers = 16
-start = post.params.gaussian_ball(nwalkers, rng, center=gaussian.truth.mean)
-sampler = emcee.EnsembleSampler(
-    nwalkers, post.ndim, lambda theta: post.log_posterior(theta)[0], vectorize=True
-)
-sampler.run_mcmc(start, 6000, progress=False)
-chain = sampler.get_chain(discard=1000, thin=10, flat=True)
+samples = run_emcee(post, 4000, rng, nwalkers=16, discard=600)
+chain = samples.points[::10]
 ```
 
 The samples should agree with exact draws from the truth, up to Monte Carlo error. A
@@ -72,34 +67,51 @@ g.triangle_plot(
 )
 ```
 
-A test needs a number rather than a plot. The mean of a chain of `n_eff` effective
-samples has a standard error of `σ / √n_eff`, where `σ` is the posterior standard
-deviation, and emcee estimates `n_eff` from the autocorrelation time. So the error of
-each mean, in units of its standard error, should be of order one:
+A test needs a number rather than a plot. The mean of `n_eff` effective samples has a
+standard error of `σ / √n_eff`, where `σ` is the posterior standard deviation; for
+MCMC, `n_effective` is the number of samples divided by the autocorrelation time. So
+the error of each mean, in units of its standard error, should be of order one:
 
 ```{code-cell} python
-steps = sampler.get_chain(discard=1000, flat=True)
-n_eff = len(steps) / sampler.get_autocorr_time(discard=1000).max()
 sd = np.sqrt(np.diag(gaussian.truth.covariance))
-(steps.mean(axis=0) - gaussian.truth.mean) / (sd / np.sqrt(n_eff))
+(samples.mean - gaussian.truth.mean) / (sd / np.sqrt(samples.n_effective))
 ```
 
 {func}`~yabf.testing.bimodal` is a harder case: two well-separated modes, with weights
 0.3 and 0.7. A sampler that claims to handle several modes should find both, with the
 right weights. A nested sampler can also be checked against the evidence, which is
-known exactly:
+known exactly. Here we run nautilus, through {func}`~yabf.sampling.run_nautilus`:
 
 ```{code-cell} python
 two_modes = testing.bimodal()
+nested = run_nautilus(two_modes.posterior, n_live=500, n_eff=5000, seed=1)
+upper = nested.weights[nested.points[:, 0] > 0].sum()
+print(f"weight of the mode at x_0 > 0: {upper:.3f} (exactly 0.7)")
+print(f"log evidence: {nested.log_evidence:.3f} (exactly {two_modes.log_evidence:.3f})")
+```
+
+Its samples follow the exact density of `x_0`, both modes included:
+
+```{code-cell} python
 x = np.linspace(-10, 10, 400)
 density = np.gradient(two_modes.truth.marginal_cdf(x, 0), x)
 
 fig, ax = plt.subplots(figsize=(5, 3))
-ax.hist(two_modes.truth.sample(20_000, rng)[:, 0], bins=80, density=True, alpha=0.5)
-ax.plot(x, density)
+ax.hist(
+    nested.points[:, 0], weights=nested.weights, bins=80, density=True, alpha=0.5,
+    label="nautilus",
+)
+ax.plot(x, density, label="exact")
 ax.set_xlabel("$x_0$")
 ax.set_ylabel("posterior density")
-print(f"log evidence: {two_modes.log_evidence:.4f}")
+ax.legend();
+```
+
+The evidence of a nested sampler is uncertain by roughly `1 / √n_eff`; this is only a
+rough estimate, so its error in those units should be a few at most:
+
+```{code-cell} python
+(nested.log_evidence - two_modes.log_evidence) * np.sqrt(nested.n_effective)
 ```
 
 ## A toy simulator
@@ -135,8 +147,17 @@ axes[2].legend();
 
 The two lightcones differ, and their averages are the same. A batched version of the
 simulator, `toy_simulation(batched=True)`, computes many points in one call, as an
-emulator would. It gives the same posterior, which is how a batched sampler adapter is
-checked against an unbatched one.
+emulator would. It computes the same posterior, so a sampler with the same seed gives
+exactly the same samples from either. This is how a batched path is checked against an
+unbatched one:
+
+```{code-cell} python
+slow = testing.toy_simulation(n_pix=50).posterior
+fast = testing.toy_simulation(n_pix=50, batched=True).posterior
+slow = run_emcee(slow, 2500, np.random.default_rng(2))
+fast = run_emcee(fast, 2500, np.random.default_rng(2))
+np.array_equal(slow.points, fast.points)
+```
 
 ## Checking a stage
 

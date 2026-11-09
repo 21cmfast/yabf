@@ -34,3 +34,9 @@ Testing
 
 .. automodule:: yabf.testing
    :members:
+
+Sampling
+--------
+
+.. automodule:: yabf.sampling
+   :members:
