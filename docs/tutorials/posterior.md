@@ -16,6 +16,7 @@ parameter space to a graph of stages, and scores the model's outputs against dat
 from collections.abc import Mapping
 from typing import ClassVar
 
+import arviz_stats
 import attrs
 import getdist
 import matplotlib.pyplot as plt
@@ -262,6 +263,17 @@ Starting the walkers near the truth makes them converge quickly. With real data 
 truth is unknown: leave out `start`, so that the walkers start across the prior, and
 run until the chains have converged. Giving `run_emcee` a `checkpoint` file writes the
 chain as it runs; calling it again with the same file resumes the run.
+
+Before using the samples, we check that the chains have converged. `to_arviz` converts
+the samples for [ArviZ](https://python.arviz.org), whose `summary` gives, for each
+parameter, the effective sample size (`ess_bulk`, `ess_tail`) and R-hat, which compares
+the chains: values near one mean they agree. Each emcee walker is one chain. The
+walkers of an ensemble are not independent, so R-hat is only a rough guide here, and
+the autocorrelation time behind `n_effective` is the better measure:
+
+```{code-cell} python
+arviz_stats.summary(samples.to_arviz(), var_names=list(post.names), kind="diagnostics")
+```
 
 To see the result, we plot the samples as a corner plot. The posterior covers the true
 values, marked by the dotted lines:
