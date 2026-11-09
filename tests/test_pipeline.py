@@ -9,7 +9,7 @@ import pytest
 
 from yabf.params import Param, ParamSpace
 from yabf.pipeline import Pipeline
-from yabf.stages import REQUIRED, All, ParamSpec, Slot
+from yabf.stages import REQUIRED, All, ParamSpec
 
 
 @attrs.frozen(eq=False)
@@ -30,7 +30,7 @@ class Simulator:
 
     made: list = attrs.field(factory=list, eq=False)
     name: str = "sim"
-    consumes: ClassVar = {
+    parameters: ClassVar = {
         "sigma": ParamSpec(REQUIRED, domain=(0, np.inf)),
         "seed": ParamSpec(0),
     }
@@ -51,7 +51,7 @@ class Measure:
     calls: list = attrs.field(factory=list, eq=False)
     name: str = "measure"
     cacheable: ClassVar = True
-    consumes: ClassVar = {}
+    parameters: ClassVar = {}
     requires: ClassVar = {"field": Field}
     provides: ClassVar = {"var": Variance}
 
@@ -65,12 +65,12 @@ class Instrument:
     """A fractional model error applied to the observable."""
 
     name: str = "instrument"
-    consumes: ClassVar = {"model_error": ParamSpec(0.0, domain=(0, np.inf))}
+    parameters: ClassVar = {"model_error": ParamSpec(0.0, domain=(0, np.inf))}
     requires: ClassVar = {"var": Variance}
-    provides: ClassVar = {"var": Slot(Variance, "observed")}
+    provides: ClassVar = {"observed": Variance}
 
     def compute(self, params, var):
-        return {"var": Variance(var.value * (1 + params["model_error"]))}
+        return {"observed": Variance(var.value * (1 + params["model_error"]))}
 
 
 @attrs.frozen
@@ -78,12 +78,12 @@ class Likelihood:
     """A Gaussian likelihood for an observed variance of one."""
 
     name: str = "like"
-    consumes: ClassVar = {}
-    requires: ClassVar = {"var": Slot(Variance, "observed")}
+    parameters: ClassVar = {}
+    requires: ClassVar = {"observed": Variance}
     provides: ClassVar = {"lnl": float}
 
-    def compute(self, params, var):
-        return {"lnl": -0.5 * (var.value - 1.0) ** 2 / 0.01}
+    def compute(self, params, observed):
+        return {"lnl": -0.5 * (observed.value - 1.0) ** 2 / 0.01}
 
 
 @attrs.frozen
@@ -93,11 +93,11 @@ class FieldsFreed:
     sim: Simulator
     seen: list = attrs.field(factory=list, eq=False)
     name: str = "probe"
-    consumes: ClassVar = {}
-    requires: ClassVar = {"var": Slot(Variance, "observed")}
+    parameters: ClassVar = {}
+    requires: ClassVar = {"observed": Variance}
     provides: ClassVar = {"ok": bool}
 
-    def compute(self, params, var):
+    def compute(self, params, observed):
         self.seen.append(all(ref() is None for ref in self.sim.made))
         return {"ok": True}
 
@@ -235,16 +235,16 @@ class Component:
     made: list = attrs.field(factory=list, eq=False)
     cacheable: ClassVar = True
     requires: ClassVar = {}
-    provides: ClassVar = {"spectrum": Slot(Spectrum, "model")}
+    provides: ClassVar = {"model": Spectrum}
 
     @property
-    def consumes(self):
+    def parameters(self):
         return {f"{self.name}_amp": ParamSpec(REQUIRED)}
 
     def compute(self, params):
         spectrum = Spectrum(params[f"{self.name}_amp"] * (FREQS / 75) ** self.index)
         self.made.append(weakref.ref(spectrum))
-        return {"spectrum": spectrum}
+        return {"model": spectrum}
 
 
 @attrs.frozen
@@ -254,8 +254,8 @@ class Residual:
     data: np.ndarray = attrs.field(eq=False)
     cacheable: bool = False
     name: str = "residual"
-    consumes: ClassVar = {}
-    requires: ClassVar = {"parts": All(Spectrum, "model")}
+    parameters: ClassVar = {}
+    requires: ClassVar = {"parts": All(Spectrum, name="model")}
     provides: ClassVar = {"chi2": float}
 
     def compute(self, params, parts):

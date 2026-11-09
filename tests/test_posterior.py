@@ -10,7 +10,7 @@ import pytest
 from yabf import priors
 from yabf.params import param_vector
 from yabf.posterior import LogLikelihood, Posterior
-from yabf.stages import ParamSpec, Slot, StageError
+from yabf.stages import One, ParamSpec, StageError
 
 X = np.linspace(-1.0, 1.0, 7)
 SIGMA = 0.5
@@ -40,7 +40,7 @@ class Polynomial:
     provides: ClassVar = {"model": Curve}
 
     @property
-    def consumes(self):
+    def parameters(self):
         return {"beta": ParamSpec(shape=(self.n,))}
 
     def compute(self, params):
@@ -59,7 +59,7 @@ class Gaussian:
     batched: bool = False
     name: str = "like"
     requires: dict = attrs.field(factory=lambda: {"model": Curve})
-    consumes: ClassVar = {}
+    parameters: ClassVar = {}
     provides: ClassVar = {"lnl": LogLikelihood, "chi2": float}
 
     def compute(self, params, model):
@@ -173,9 +173,9 @@ class Smooth:
     sim: Polynomial
     alive: list = attrs.field(factory=list)
     name: str = "smooth"
-    consumes: ClassVar = {}
+    parameters: ClassVar = {}
     requires: ClassVar = {"model": Curve}
-    provides: ClassVar = {"smoothed": Slot(Curve, "smoothed")}
+    provides: ClassVar = {"smoothed": Curve}
 
     def compute(self, params, model):
         self.alive.append(sum(r() is not None for r in self.sim.made))
@@ -187,7 +187,7 @@ def test_unbatched_stages_release_each_point_before_the_next():
     even when a batched stage comes after them."""
     sim = Polynomial(2)
     smooth = Smooth(sim)
-    like = Gaussian(DATA, batched=True, requires={"model": Slot(Curve, "smoothed")})
+    like = Gaussian(DATA, batched=True, requires={"model": One(Curve, name="smoothed")})
     post = Posterior(
         param_vector("beta", 2, prior=priors.normal(0.0, TAU)), [sim, smooth, like]
     )
