@@ -16,6 +16,9 @@ parameter space to a graph of stages, and scores the model's outputs against dat
 from collections.abc import Mapping
 from typing import ClassVar
 
+import tempfile
+from pathlib import Path
+
 import arviz_stats
 import attrs
 import getdist
@@ -23,6 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from getdist import plots
 
+from yabf import cosmosis
 from yabf.likelihoods import Gaussian
 from yabf.params import Param
 from yabf.posterior import LikelihoodTerm, Posterior
@@ -308,6 +312,52 @@ ax.set_xlabel(r"$\nu$ [MHz]")
 ax.set_ylabel("T [K]")
 ax.legend();
 ```
+
+## Long runs: a dry run, then CosmoSIS
+
+A real analysis runs a simulator that takes minutes per point, on many processes, for
+days. Before starting such a run, it is worth checking, in seconds, that the posterior
+can be computed at all. {func}`~yabf.cosmosis.dry_run` does this: it computes the
+posterior at the centre of the prior and at a few draws from it, timing each and
+catching any error, and reports the peak memory. Given an output directory, it also
+writes these points to a chain and reads them back, as a real run would, and checks
+that nothing was lost on the way. Here we use a temporary directory; in a real run,
+this would be a directory you keep:
+
+```{code-cell} python
+output = Path(tempfile.mkdtemp())
+report = cosmosis.dry_run(post, rng, n_draws=3, output=output / "dry_run")
+print(report)
+```
+
+For the run itself, [CosmoSIS](https://cosmosis.readthedocs.io) drives many samplers
+in the same way, with checkpoints to resume from and MPI to spread the work over
+many processes. {func}`~yabf.cosmosis.run` runs one of them on the posterior, here
+the nested sampler nautilus, and returns the same {class}`~yabf.sampling.Samples` as
+`run_emcee`. A nested sampler also estimates the evidence:
+
+```{code-cell} python
+nested = cosmosis.run(
+    post,
+    "nautilus",
+    output / "nautilus",
+    options={"n_live": 300, "n_networks": 1, "seed": 1},
+)
+print(f"log evidence: {nested.log_evidence:.2f}")
+for name, a, b in zip(post.names, nested.mean, samples.mean, strict=True):
+    print(f"{name:>8}: {a:.6g} (nautilus)  {b:.6g} (emcee)")
+```
+
+Both samplers agree. To run on several processes, launch the same script on each of
+them, with `python -m mpi4py`, which stops every process if one of them fails:
+
+```bash
+mpirun -n 64 python -m mpi4py run.py
+```
+
+The first process drives the sampler and gets the samples; the others compute the
+posterior, and get None. Calling `run` again with `resume=True` continues from the
+last checkpoint in the output directory.
 
 ## Several data sets
 
