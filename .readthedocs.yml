@@ -9,12 +9,20 @@ version: 2
 sphinx:
   configuration: docs/conf.py
 
-conda:
-  environment: docs/environment.yaml
+build:
+  os: ubuntu-24.04
+  tools:
+    # Matches .python-version, so uv uses this interpreter instead of downloading one.
+    python: "3.14"
 
-python:
-   version: 3.7
-   install:
-      - method: pip
-        path: .
-   system_packages: true
+  jobs:
+    pre_create_environment:
+      # uv from PyPI, not from GitHub releases (which Read the Docs' builders can't
+      # always reach). The reshim puts asdf's shim for it on PATH, which the install
+      # step, run in the activated virtualenv, needs.
+      - python -m pip install uv
+      - asdf reshim python
+    create_environment:
+      - uv venv "${READTHEDOCS_VIRTUALENV_PATH}"
+    install:
+      - UV_PROJECT_ENVIRONMENT="${READTHEDOCS_VIRTUALENV_PATH}" uv sync --frozen --group docs
