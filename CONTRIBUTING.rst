@@ -129,6 +129,11 @@ Every test runs on every push, in seconds, without any simulator installed:
   simulator chain (a seeded "lightcone" and its average). A sampler passes if it
   recovers their moments within Monte Carlo error.
 
+The CosmoSIS driver's tests need CosmoSIS, which builds with a Fortran compiler
+(``MPIFC=mpif90 uv pip install cosmosis mpi4py``), and its MPI tests need
+``mpirun``; without them, those tests are skipped. A separate CI job runs them
+under Open MPI.
+
 CI also checks that the v3 core (``params``, ``priors``, ``stages``, ``pipeline``,
 ``posterior``, ``likelihoods``, ``testing`` and ``sampling``) stays at least 90%
 covered.
