@@ -107,7 +107,12 @@ Before you submit a pull request, check that it meets these guidelines:
 
 1. The pull request should include tests.
 2. If the pull request adds functionality, the docs should be updated. Put
-   your new functionality into a function with a docstring.
+   your new functionality into a function with a docstring, and show how to use it
+   in a tutorial in ``docs/tutorials``, a new one or an update to an existing one.
+   The tutorials are `MyST notebooks <https://myst-nb.readthedocs.io>`_, run on
+   every build of the docs; build them locally with::
+
+    $ uv run sphinx-build -b html docs docs/_build/html
 3. The pull request should pass CI on all supported Python versions (3.12+).
 
 Tips

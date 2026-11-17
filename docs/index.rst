@@ -1,5 +1,5 @@
 Welcome to yabf's documentation!
-======================================
+================================
 
 .. toctree::
    :maxdepth: 2
@@ -7,8 +7,8 @@ Welcome to yabf's documentation!
 
    readme
    installation
-   usage
-   modules
+   tutorials/index
+   api
    contributing
    authors
    history
