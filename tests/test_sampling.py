@@ -8,6 +8,7 @@ must give the same samples.
 
 import hashlib
 
+import arviz_stats
 import attrs
 import nautilus
 import numpy as np
@@ -196,14 +197,96 @@ def test_the_moments_and_getdist_use_the_weights():
     np.testing.assert_allclose(mc.getMeans()[:2], samples.mean)
 
 
+def test_systematic_resampling_keeps_each_samples_share():
+    """Each sample appears floor(n w) or ceil(n w) times among n resampled ones."""
+    rng = np.random.default_rng(8)
+    weights = rng.dirichlet(np.ones(50))
+    samples = sampling.Samples(
+        names=("i", "x"),
+        points=np.column_stack([np.arange(50), rng.normal(size=50)]),
+        weights=weights,
+        log_likelihood=np.zeros(50),
+        log_prior=np.zeros(50),
+        derived={("stage", "out"): np.arange(50) * 2.0},
+        n_effective=20.0,
+    )
+    n = 1000
+    resampled = samples.resample(n, rng)
+    counts = np.bincount(resampled.points[:, 0].astype(int), minlength=50)
+    assert np.all(counts >= np.floor(n * weights))
+    assert np.all(counts <= np.ceil(n * weights))
+    assert resampled.equally_weighted
+    np.testing.assert_array_equal(
+        resampled.derived["stage", "out"], resampled.points[:, 0] * 2
+    )
+    assert resampled.n_effective == 20.0
+
+
+def test_emcee_samples_keep_each_walkers_chain_for_arviz():
+    """In ArviZ, each chain is one walker: a rejected move repeats the walker's last
+    position, so consecutive draws of a chain are often equal, which they never are
+    between different walkers. After a converged run, R-hat is close to one."""
+    analytic = testing.correlated_gaussian()
+    post = analytic.posterior
+    rng = np.random.default_rng(9)
+    start = post.params.gaussian_ball(16, rng, center=analytic.truth.mean)
+    samples = sampling.run_emcee(post, 3000, rng, start=start, discard=600)
+    assert samples.n_chains == 16
+
+    tree = samples.to_arviz(params=post.params)
+    x0 = tree.posterior["x_0"].values
+    assert x0.shape == (16, 2400)
+    np.testing.assert_array_equal(x0.ravel(), samples.points[:, 0])
+    np.testing.assert_array_equal(
+        tree.posterior["x"].values[..., 1], tree.posterior["x_1"]
+    )
+    repeats = np.mean(x0[:, 1:] == x0[:, :-1])
+    assert 0.2 < repeats < 0.9
+    np.testing.assert_allclose(
+        tree.sample_stats["lp"].values.ravel(),
+        samples.log_likelihood + samples.log_prior,
+    )
+    rhat = arviz_stats.summary(tree, var_names=list(post.names), kind="diagnostics")[
+        "r_hat"
+    ]
+    assert np.all(rhat.astype(float) < 1.05)
+
+
+def test_arviz_takes_derived_outputs_with_their_coordinates():
+    analytic = testing.toy_simulation(n_pix=50, batched=True)
+    samples = sampling.run_emcee(_with_signal(analytic), 150, np.random.default_rng(3))
+    freq = np.linspace(50.0, 100.0, 40)
+    tree = samples.to_arviz(
+        dims={"global_signal.global_signal": ["freq"]}, coords={"freq": freq}
+    )
+    signal = tree.posterior["global_signal.global_signal"]
+    assert signal.dims == ("chain", "draw", "freq")
+    np.testing.assert_array_equal(signal["freq"], freq)
+    np.testing.assert_array_equal(
+        signal.values.reshape(-1, 40), samples.derived[SIGNAL]
+    )
+    assert tree.posterior.attrs["sampler"] == "emcee"
+
+
+def test_arviz_refuses_weighted_samples():
+    analytic = testing.bimodal()
+    samples = sampling.run_nautilus(analytic.posterior, seed=7, **FAST_NAUTILUS)
+    with pytest.raises(ValueError, match="resample these first"):
+        samples.to_arviz()
+    tree = samples.resample(2000, np.random.default_rng(10)).to_arviz()
+    assert tree.posterior["x_0"].shape == (1, 2000)
+    assert tree.posterior.attrs["log_evidence"] == samples.log_evidence
+
+
 @pytest.mark.parametrize(
     ("change", "match"),
     [
         ({"weights": np.full(3, 0.5)}, "sum to one"),
+        ({"n_chains": 2}, "cannot be 2 chains"),
         ({"log_prior": np.zeros(2)}, "2 entries for 3 samples"),
         ({"points": np.zeros((3, 3))}, "shape"),
     ],
-    ids=["weights", "length", "points"],
+    ids=["weights", "chains", "length", "points"],
 )
 def test_inconsistent_samples_are_rejected(change, match):
     good = {
