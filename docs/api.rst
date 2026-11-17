@@ -28,3 +28,9 @@ Posteriors and likelihoods
 
 .. automodule:: yabf.likelihoods
    :members:
+
+Testing
+-------
+
+.. automodule:: yabf.testing
+   :members:

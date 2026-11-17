@@ -10,7 +10,9 @@ This example is merely representative and simple.
 
 The tutorials are best read in order: the first defines the parameters, the second
 builds the model from stages, and the third turns the model into a posterior and
-samples it. Each one runs as it is shown here, and can also be read on its own.
+samples it. The fourth shows how to test samplers and stages on posteriors whose
+answer is known exactly. Each one runs as it is shown here, and can also be read on
+its own.
 
 .. toctree::
    :maxdepth: 1
@@ -18,3 +20,4 @@ samples it. Each one runs as it is shown here, and can also be read on its own.
    parameters
    stages
    posterior
+   testing
