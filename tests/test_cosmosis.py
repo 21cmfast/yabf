@@ -99,6 +99,10 @@ def test_a_dry_run_computes_writes_and_reads_back(tmp_path):
     )
     assert report.ok, str(report)
     assert report.points.shape == (4, posterior.ndim)
+    basis = posterior.stages[0].basis
+    np.testing.assert_allclose(
+        np.array([b[SIGNAL] for b in report.blobs]), report.points @ basis.T
+    )
     np.testing.assert_allclose(
         report.points[0], posterior.prior_transform(np.full(posterior.ndim, 0.5))
     )
@@ -144,6 +148,7 @@ def test_a_dry_run_catches_a_broken_stage(how, message):
     assert not report.ok
     assert message in str(report).splitlines()[1]
     assert len(report.errors) == 6
+    assert [b is None for b in report.blobs] == [e is not None for e in report.errors]
 
 
 @attrs.frozen

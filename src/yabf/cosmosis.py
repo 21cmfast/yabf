@@ -380,6 +380,8 @@ class DryRunReport:
         prior, then draws from it.
     log_likelihood
         The log-likelihood at each point; NaN where it failed.
+    blobs
+        The derived outputs at each point, by output; None where it failed.
     seconds
         The time each evaluation took.
     errors
@@ -393,6 +395,7 @@ class DryRunReport:
     names: tuple[str, ...]
     points: np.ndarray
     log_likelihood: np.ndarray
+    blobs: tuple[Mapping[Output, object] | None, ...]
     seconds: np.ndarray
     errors: tuple[str | None, ...]
     peak_memory: int
@@ -454,7 +457,7 @@ def dry_run(
     lnl = np.full(len(points), np.nan)
     seconds = np.zeros(len(points))
     errors: list[str | None] = []
-    blobs = []
+    blobs: list[Mapping[Output, object] | None] = []
     for i, theta in enumerate(points):
         start = time.perf_counter()
         try:
@@ -473,6 +476,7 @@ def dry_run(
         names=tuple(posterior.names),
         points=points,
         log_likelihood=lnl,
+        blobs=tuple(blobs),
         seconds=seconds,
         errors=tuple(errors),
         peak_memory=_peak_memory(),
