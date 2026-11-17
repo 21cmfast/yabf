@@ -130,7 +130,8 @@ Every test runs on every push, in seconds, without any simulator installed:
   recovers their moments within Monte Carlo error.
 
 CI also checks that the v3 core (``params``, ``priors``, ``stages``, ``pipeline``,
-``posterior``, ``likelihoods`` and ``testing``) stays at least 90% covered.
+``posterior``, ``likelihoods``, ``testing`` and ``sampling``) stays at least 90%
+covered.
 
 To run a subset of tests::
 
