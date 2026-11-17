@@ -6,6 +6,10 @@ kernelspec:
 
 # Posteriors, likelihoods and mock data
 
+```{note}
+This page is a Jupyter notebook: {nb-download}`download it <posterior.ipynb>` to run the code and change it yourself.
+```
+
 In this tutorial we put the pieces of the previous two together into an inference.
 We draw a mock measurement of the global 21-cm signal, recover the trough from it with
 an MCMC sampler, and check that the posterior covers the true values. The object that

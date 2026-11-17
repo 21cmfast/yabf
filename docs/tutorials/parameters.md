@@ -6,6 +6,10 @@ kernelspec:
 
 # Parameters and priors
 
+```{note}
+This page is a Jupyter notebook: {nb-download}`download it <parameters.ipynb>` to run the code and change it yourself.
+```
+
 Every model in `yabf` declares the parameters it needs in order to compute. In these
 tutorials, for example, the foreground of the sky spectrum needs an amplitude and a
 spectral index, and the 21-cm absorption trough needs a depth, a centre and a width.

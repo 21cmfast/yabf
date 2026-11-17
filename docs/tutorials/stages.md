@@ -6,6 +6,10 @@ kernelspec:
 
 # Stages and the pipeline
 
+```{note}
+This page is a Jupyter notebook: {nb-download}`download it <stages.ipynb>` to run the code and change it yourself.
+```
+
 In this tutorial we build a model of the sky-averaged radio spectrum between 50 and
 100 MHz: a bright foreground, a faint absorption trough from the 21-cm line, and an
 instrument that measures their sum. Along the way, we see how `yabf` splits a model
