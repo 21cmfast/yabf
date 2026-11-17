@@ -6,6 +6,10 @@ kernelspec:
 
 # Testing samplers and stages
 
+```{note}
+This page is a Jupyter notebook: {nb-download}`download it <testing.ipynb>` to run the code and change it yourself.
+```
+
 Before trusting a sampler, or a stage you have written, it is worth checking it on a
 problem whose answer you already know. {mod}`yabf.testing` provides such problems:
 posteriors that are known exactly, and a check that a stage keeps the stage protocol.
