@@ -19,7 +19,7 @@ import attrs
 import numpy as np
 import pytest
 
-from yabf import cosmosis, testing
+from yabf import cosmosis, sampling, testing
 from yabf.params import Param
 from yabf.posterior import LogLikelihood, Posterior
 from yabf.stages import ParamSpec
@@ -52,16 +52,28 @@ def _check(samples, analytic, posterior):
     )
 
 
-def test_nautilus_through_cosmosis_recovers_the_posterior(tmp_path):
-    """The chain CosmoSIS writes, read back, has the posterior's moments and
-    evidence, each sample's derived output, and its log-likelihood."""
+def test_nautilus_through_cosmosis_matches_the_direct_adapter(tmp_path):
+    """Nautilus run through CosmoSIS, and run directly, give the same samples: the
+    same parameters and derived outputs, of the same shapes and types. Each run has
+    the posterior's moments and evidence, each sample's derived output, and its
+    log-likelihood."""
     analytic, posterior = _toy()
-    samples = cosmosis.run(posterior, "nautilus", tmp_path, options=NAUTILUS)
-    assert samples.finished
-    assert samples.sampler == "nautilus"
-    _check(samples, analytic, posterior)
-    error = 1 / np.sqrt(samples.n_effective)
-    assert abs(samples.log_evidence - analytic.log_evidence) < 5 * error
+    runs = {
+        "cosmosis": cosmosis.run(posterior, "nautilus", tmp_path, options=NAUTILUS),
+        "direct": sampling.run_nautilus(posterior, **NAUTILUS),
+    }
+    via, direct = runs["cosmosis"], runs["direct"]
+    assert via.names == direct.names
+    assert via.derived.keys() == direct.derived.keys()
+    for key, values in direct.derived.items():
+        assert via.derived[key].shape[1:] == values.shape[1:]
+        assert via.derived[key].dtype == values.dtype
+    for samples in runs.values():
+        assert samples.finished
+        assert samples.sampler == "nautilus"
+        _check(samples, analytic, posterior)
+        error = 1 / np.sqrt(samples.n_effective)
+        assert abs(samples.log_evidence - analytic.log_evidence) < 5 * error
 
 
 def test_multinest_through_cosmosis_recovers_two_modes(tmp_path):
@@ -167,7 +179,7 @@ mpi = pytest.mark.skipif(
 SCRIPT = """
     import sys, time
     import attrs, numpy as np
-    from yabf import cosmosis, testing
+    from yabf import cosmosis, sampling, testing
 
     class Slow(testing.GlobalSignal):
         def compute(self, params, lightcone):
